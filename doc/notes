@@ -1,0 +1,33 @@
+== moca, mopa
+
+--- directory organization
+
+. sched
+.. static
+... kaapi_static
+.. ws
+... kaapi_sched_ws_splitter_t // affinity splltter ...
+
+. data // contains the data structure
+.. concurrent_range
+.. conccurent_stream -> range + current lower bound, for reduction
+.. hlock_t // hierarchical lock
+.. lock_t // flat lock
+
+. memory // how to communicate in between as
+.. 
+
+. arch
+.. common // kaapi_proc abi
+.. cuda // initialisation, task execution routine
+.. host, generic // default architecture
+
+. system
+.. kaapi_sys_get_numa
+.. kaapi_sys_get_l1();
+
+. topology // idea is to build the virtual machine topo
+.. kaapi_topo_create_flat
+.. kaapi_topo_create_tree
+
+--
