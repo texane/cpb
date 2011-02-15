@@ -1,7 +1,9 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <pthread.h>
+#include <numaif.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 
@@ -12,8 +14,9 @@
 #define CONFIG_USE_IDKOIFF 1
 #define CONFIG_USE_IDFREEZE 0
 
-#define CONFIG_USE_LOCAL_WS 1
-#define CONFIG_USE_REMOTE_WS 0
+#define CONFIG_PAGE_SIZE 0x1000
+
+#define CONFIG_PROC_COUNT 128
 
 
 /* atomics
@@ -32,6 +35,11 @@ static inline unsigned long kaapi_atomic_read(kaapi_atomic_t* a)
 static inline void kaapi_atomic_write(kaapi_atomic_t* a, unsigned long n)
 {
   a->value = n;
+}
+
+static inline void kaapi_atomic_or(kaapi_atomic_t* a, unsigned long n)
+{
+  __sync_or_and_fetch(&a->value, n);
 }
 
 static inline void kaapi_atomic_sub(kaapi_atomic_t* a, unsigned long n)
@@ -75,7 +83,7 @@ static inline unsigned int kaapi_lock_try_acquire(kaapi_lock_t* l)
 
   /* put in cache, then try lock */
   if (kaapi_atomic_read(l)) return 0;
-  return __sync_bool_compare_and_swap(l, 0, 1) - 1;
+  return __sync_bool_compare_and_swap(&l->value, 0, 1) - 1;
 } 
 
 static inline void kaapi_lock_acquire(kaapi_lock_t* l)
@@ -149,9 +157,68 @@ static inline void kaapi_bitmap_or
   a->bits[1] |= b->bits[1];
 }
 
+static size_t kaapi_bitmap_pos
+(const kaapi_bitmap_t* bitmap, size_t i)
+{
+  /* return the position of ith bit set */
+
+  size_t pos = kaapi_bitmap_scan(bitmap, 0);
+
+  for (i -= 1; i; --i)
+    pos = kaapi_bitmap_scan(bitmap, pos + 1);
+
+  return pos;
+}
+
+
+/* global processing unit id
+ */
+
+typedef unsigned long kaapi_procid_t;
+
+
+/* numa routines
+ */
+
+static int kaapi_numa_bind
+(void* addr, size_t size, kaapi_procid_t procid)
+{
+  const int mode = MPOL_BIND;
+  const unsigned int flags = MPOL_MF_STRICT | MPOL_MF_MOVE;
+  const unsigned long maxnode = CONFIG_PROC_COUNT;
+  
+  unsigned long nodemask[CONFIG_PROC_COUNT / (8 * sizeof(unsigned long))];
+
+  memset(nodemask, 0, sizeof(nodemask));
+
+  nodemask[procid / (8 * sizeof(unsigned long))] |=
+    1UL << (procid % (8 * sizeof(unsigned long)));
+
+  if (mbind(addr, size, mode, nodemask, maxnode, flags))
+    return -1;
+
+  return 0;
+}
+
+
+/* workstealing request outcome
+ */
+
+typedef struct kaapi_ws_work
+{
+  void (*execfn)(void*);
+  void* data;
+} kaapi_ws_work_t;
+
+static inline void kaapi_ws_work_exec(kaapi_ws_work_t* w)
+{
+  w->execfn(w->data);
+}
+
 
 /* workstealing request
  */
+
 typedef struct kaapi_ws_request
 {
   volatile kaapi_procid_t victim_id;
@@ -169,7 +236,7 @@ typedef struct kaapi_ws_request
 } kaapi_ws_request_t;
 
 static void kaapi_ws_request_post
-(kaapi_ws_request_t* req, kaapi_procid_t id)
+(kaapi_ws_request_t* req, kaapi_procid_t victim_id)
 {
   req->victim_id = victim_id;
   kaapi_mem_write_barrier();
@@ -186,9 +253,15 @@ static inline void kaapi_ws_request_reply
 static inline unsigned int kaapi_ws_request_test_ack
 (kaapi_ws_request_t* req)
 {
-  /* todo_not_implemented */
-  
-  return 0;
+  /* return a boolean value */
+
+  const unsigned long ored_value =
+    KAAPI_WS_REQUEST_REPLIED | KAAPI_WS_REQUEST_POSTED;
+
+  unsigned int is_replied = __sync_bool_compare_and_swap
+    (&req->status.value, ored_value, KAAPI_WS_REQUEST_UNDEF);
+
+  return is_replied;
 }
 
 static inline void* kaapi_ws_request_alloc_data
@@ -207,14 +280,8 @@ typedef void (*kaapi_ws_splitfn_t)(void*);
 
 struct kaapi_ws_group;
 
-typedef unsigned long kaapi_procid_t;
-
 typedef struct kaapi_proc
 {
-  /* system related */
-  pthread_t thread;
-  size_t mapped_size;
-
   /* registers */
   kaapi_procid_t id_word;
 
@@ -240,36 +307,47 @@ typedef struct kaapi_proc
 
 } kaapi_proc_t;
 
-#define KAAPI_PROC_COUNT 128
+static kaapi_proc_t* volatile kaapi_all_procs[CONFIG_PROC_COUNT];
 
-static kaapi_proc_t* volatile kaapi_all_procs[KAAPI_PROC_COUNT];
+static pthread_key_t kaapi_proc_key;
 
 static inline kaapi_proc_t* kaapi_proc_get_self(void)
 {
-  /* todo_not_implemented */
-  return NULL;
+  return pthread_getspecific(kaapi_proc_key);
 }
 
-static kaapi_proc_t* kaapi_proc_create(kaapi_procid_t id)
+static kaapi_proc_t* kaapi_proc_alloc(kaapi_procid_t id)
 {
-  /* todo_not_implemented
-     allocate a page and store the kproc_proc_t at the
-     beginning of the page. bind the page on the right
-     numa node.
-   */
+  /* allocate a bound page containing the proc */
 
-  return NULL;
+  kaapi_proc_t* proc;
+
+  if (posix_memalign((void**)&proc, CONFIG_PAGE_SIZE, sizeof(kaapi_proc_t)))
+    return NULL;
+
+  kaapi_numa_bind(proc, sizeof(kaapi_proc_t), id);
+
+  return proc;
 }
 
-static void kaapi_proc_destroy(kaapi_proc_t* proc)
+static inline void kaapi_proc_free(kaapi_proc_t* proc)
 {
-  munmap((void*)proc, proc->mapped_size);
+  free(proc);
 }
 
-static void kaapi_proc_init(kaapi_proc_t* proc)
+static void kaapi_proc_init(kaapi_proc_t* proc, kaapi_procid_t id)
 {
-  kaapi_atomic_write(proc->control_word, KAAPI_PROC_CONTROL_UNDEF);
-  kaapi_atomic_write(proc->status_word, KAAPI_PROC_STATUS_UNDEF);
+  proc->id_word = id;
+
+  kaapi_atomic_write(&proc->control_word, KAAPI_PROC_CONTROL_UNDEF);
+  kaapi_atomic_write(&proc->status_word, KAAPI_PROC_STATUS_UNDEF);
+
+  kaapi_atomic_write(&proc->ws_split_refn, 0);
+  proc->ws_split_fn = NULL;
+
+  proc->ws_group = NULL;
+
+  kaapi_atomic_write(&proc->ws_request.status, KAAPI_WS_REQUEST_UNDEF);
 }
 
 
@@ -288,18 +366,20 @@ typedef struct kaapi_proc_args
   pthread_barrier_t* barrier;
 } kaapi_proc_args_t;
 
+static int kaapi_ws_steal_work(kaapi_ws_work_t*);
+
 static void* kaapi_proc_thread_entry(void* p)
 {
   const kaapi_proc_args_t* const args = (const kaapi_proc_args_t*)p;
 
-  /* todo_not_implemented
-     signal the barrier once done
-   */
+  kaapi_proc_t* const self_proc = kaapi_proc_alloc(args->id);
 
+  pthread_setspecific(kaapi_proc_key, self_proc);
   kaapi_all_procs[args->id] = self_proc;
   kaapi_mem_write_barrier();
 
-  pthread_barrier_signal(args->barrier);
+  /* wait until everyone ready */
+  pthread_barrier_wait(args->barrier);
 
   while (1)
   {
@@ -307,7 +387,8 @@ static void* kaapi_proc_thread_entry(void* p)
     {
     case KAAPI_PROC_CONTROL_TERM:
       {
-	kaapi_atomic_write(&self_proc->status, KAAPI_WS_STATUS_TERM);
+	kaapi_atomic_write
+	  (&self_proc->status_word, KAAPI_PROC_STATUS_TERM);
 	break ;
       }
 
@@ -388,9 +469,12 @@ static int kaapi_memtopo_get_group_members
 
 /* uniform binding of pages on nodes at level
  */
+
 static int kaapi_memtopo_bind_uniform
 (void* addr, size_t size, unsigned int level)
 {
+#if 0 /* todo_not_implemented */
+
   kaapi_ws_layer_t* pos = kwl;
 
   const kaapi_ws_group_t* group;
@@ -412,8 +496,6 @@ static int kaapi_memtopo_bind_uniform
      mem_size = per_group * group_count
    */
 
-#define CONFIG_PAGE_SIZE 0x1000
-
   size_per_group = size / pos->group_count;
   block_size = size_per_group;
   if (size_per_group % size)
@@ -431,6 +513,9 @@ static int kaapi_memtopo_bind_uniform
   return 0;
 
  on_failure:
+
+#endif /* todo_not_implemented */
+
   return -1;
 }
 
@@ -464,7 +549,7 @@ typedef unsigned long kaapi_groupid_t;
 static inline kaapi_procid_t kaapi_ws_groupid_to_procid
 (kaapi_ws_group_t* group, kaapi_groupid_t id)
 {
-  return (kaapi_procid_t)kaapi_bitmap_scan(group, (size_t)id);
+  return (kaapi_procid_t)kaapi_bitmap_pos(&group->members, (size_t)id);
 }
 
 
@@ -472,6 +557,8 @@ static inline kaapi_procid_t kaapi_ws_groupid_to_procid
  */
 static kaapi_ws_group_t* kaapi_ws_group_create(size_t member_count)
 {
+#if 0 /* todo_not_implemented */
+
   const size_t total_size =
     offsetof(kaapi_ws_group_t, reqs) + member_count * sizeof(kaapi_ws_request_t);
 
@@ -484,6 +571,12 @@ static kaapi_ws_group_t* kaapi_ws_group_create(size_t member_count)
   kaapi_bitmap_zero(&group->members);
 
   return group;
+
+#else
+
+  return NULL;
+
+#endif /* todo_not_implemented */
 }
 
 static inline void kaapi_ws_group_destroy
@@ -562,12 +655,6 @@ static kaapi_ws_groupid_t select_group_victim(kaapi_ws_group_t* group)
 /* emit a steal request
  */
 
-typedef struct kaapi_ws_work
-{
-  void (*execfn)(void*);
-  void* data;
-} kaaip_ws_work_t;
-
 static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 {
   /* todo: when walking up the hierarchy, the thread
@@ -583,15 +670,15 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   kaapi_proc_t* const self_proc = kaapi_proc_get_self();
   kaapi_ws_group_t* const group = self_proc->group;
 
-  kaapi_groupid_t victim_groupid;
+  kaapi_procid_t victim_id;
   kaapi_proc_t* victim_proc;
   int error = -1;
 
   /* emit the stealing request */
-  victim_groupid = select_victim(group);
-  kaapi_ws_request_post(self_request, victim_groupid);
+  victim_id = kaapi_ws_groupid_to_procid(group, select_victim(group));
+  kaapi_ws_request_post(&self_proc->ws_request, victim_procid);
 
- try_acquire:
+ redo_acquire:
   if (kaapi_lock_try_acquire(&group->lock))
   {
     /* success, split amongst the group members */
@@ -611,32 +698,22 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
     kaapi_lock_unlock(&group->lock);
   } /* try_acquire */
 
-#if 0 /* todo_not_implemented */
   /* test our own request */
-  if (group->reply_words[member_addr] == REPLIED)
+  if (kaapi_ws_request_test_ack(&self_proc->ws_request))
   {
     work->execfn = self_req->execfn;
     work->data = self_req->data;
     goto on_success;
   }
-#endif /* todo_not_implemented */
 
   /* try to lock again */
-  goto try_acquire;
+  goto redo_acquire;
 
  on_success:
   error = 0;
 
  on_failure:
   return error;
-}
-
-
-/* execute the stolen work
- */
-static inline void kaapi_ws_work_exec(kaapi_ws_work_t* w)
-{
-  w->execfn(w->data);
 }
 
 
@@ -741,7 +818,8 @@ static int kaapi_ws_start_groups
     {
       pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
       sched_yield();
-      kaapi_all_procs[0] = kaapi_proc_create(0);
+      kaapi_all_procs[0] = kaapi_proc_alloc(0);
+      pthread_setspecific(kaapi_proc_key, kaapi_all_procs[0]);
       goto next_member;
     }
 
@@ -789,6 +867,27 @@ static void kaapi_ws_leave_adpative
   /* wait for no one using the splitter */
   while (kaapi_atomic_read(&proc->ws_refn))
     ;
+}
+
+
+/* kaapi constructor, destructor
+ */
+
+static int kaapi_initialize(void)
+{
+  if (pthread_key_create(&kaapi_proc_key, NULL)) return -1;
+  return 0;
+}
+
+static void kaapi_finalize(void)
+{
+  pthread_key_delete(kaapi_proc_key);
+
+  if (kaapi_all_procs[0] != NULL)
+  {
+    kaapi_proc_free(kaapi_all_procs[0]);
+    kaapi_all_procs[0] = NULL;
+  }
 }
 
 
@@ -981,15 +1080,17 @@ static int for_foreach
 
 static int allocate_array(void** addr, size_t count)
 {
-  
+  /* todo_not_implemented */
+  return -1;
 }
 
 static int free_array(void* addr, size_t count)
 {
-  munmap(addr, size);
+  /* todo_not_implemented */
+  return -1;
 }
 
-static int fill_array(void* addr, size_t size)
+static void fill_array(void* addr, size_t size)
 {
   memset(addr, 0, size);
 }
@@ -1004,8 +1105,9 @@ int main(int ac, char** av)
   double* array = NULL;
   size_t count = CONFIG_ARRAY_COUNT;
 
-  if (allocate_array(&array, count * sizeof(double)))
-    return -1;
+  kaapi_initialize();
+
+  allocate_array(&array, count * sizeof(double));
 
   /* so that pages are bound on the current core */
   fill_array(array, count * sizeof(double));
@@ -1013,6 +1115,8 @@ int main(int ac, char** av)
   for_foreach(array, count, 1000);
 
   free_array(array, count * sizeof(double));
+
+  kaapi_finalize();
 
   return 0;
 }
