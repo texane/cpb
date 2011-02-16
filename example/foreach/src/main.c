@@ -1,12 +1,12 @@
 #define _GNU_SOURCE 1
 #include <sched.h>
 
+#include <unistd.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
-#include <numaif.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 
@@ -143,8 +143,8 @@ static inline size_t kaapi_bitmap_count
 static inline void kaapi_bitmap_set
 (kaapi_bitmap_t* bitmap, size_t i)
 {
-  bitmap->bits[0] |= (unsigned long)i & ((1UL << 6) - 1UL);
-  bitmap->bits[1] |= (unsigned long)i >> 6;
+  const size_t j = i / (8 * sizeof(unsigned long));
+  bitmap->bits[j] |= 1UL << (i % (8 * sizeof(unsigned long)));
 }
 
 static inline void kaapi_bitmap_dup
@@ -163,10 +163,11 @@ static inline unsigned int kaapi_bitmap_is_empty
 static inline size_t kaapi_bitmap_scan
 (const kaapi_bitmap_t* bitmap, size_t i)
 {
-  /* scan for the first bit set, from pos i (included).
-     assume the bitmap is not empty.
-   */
-  return __builtin_ffsl(bitmap->bits[(unsigned long)i >> 6]) - 1;
+  const size_t j = i / (8 * sizeof(unsigned long));
+  const unsigned long mask = ~((1UL << (i % (8 * sizeof(unsigned long)))) - 1UL);
+
+  /* mask the lower bits and scan */
+  return (j * 8 * sizeof(unsigned long)) + __builtin_ffsl(bitmap->bits[j] & mask) - 1;
 }
 
 static inline void kaapi_bitmap_or
@@ -196,6 +197,10 @@ static size_t kaapi_bitmap_pos
 typedef unsigned long kaapi_procid_t;
 
 
+#if CONFIG_USE_NUMA
+
+# inlcude <numaif.h>
+
 /* numa routines
  */
 
@@ -218,6 +223,8 @@ static int kaapi_numa_bind
 
   return 0;
 }
+
+#endif /* CONFIG_USE_NUMA */
 
 
 /* workstealing request outcome
@@ -347,7 +354,9 @@ static kaapi_proc_t* kaapi_proc_alloc(kaapi_procid_t id)
   if (posix_memalign((void**)&proc, CONFIG_PAGE_SIZE, sizeof(kaapi_proc_t)))
     return NULL;
 
+#if CONFIG_NUMA_BIND
   kaapi_numa_bind(proc, sizeof(kaapi_proc_t), id);
+#endif
 
   return proc;
 }
@@ -623,6 +632,29 @@ static void kaapi_ws_destroy_mem_groups
 (kaapi_ws_group_t* groups, size_t group_count)
 {
   free(groups);
+}
+
+
+/* build a flat group, containing all the available cores
+ */
+
+static void kaapi_ws_create_flat_group(kaapi_ws_group_t* group)
+{
+  const char* const s = getenv("KAAPI_CPUCOUNT");
+  size_t i, cpu_count;
+
+  cpu_count = sysconf(_SC_NPROCESSORS_CONF);
+  if ((s != NULL) && (cpu_count > atoi(s)))
+    cpu_count = atoi(s);
+
+  /* create a [0, cpu_count[ flat group */
+  kaapi_ws_group_init(group);
+  group->member_count = cpu_count;
+  group->flags |= kaapi_ws_group_contiguous;
+  group->first_procid = 0;
+
+  for (i = 0; i < cpu_count; ++i)
+    kaapi_bitmap_set(&group->members, i);
 }
 
 
