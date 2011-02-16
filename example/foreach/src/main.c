@@ -47,7 +47,7 @@ static inline void kaapi_atomic_write(kaapi_atomic_t* a, unsigned long n)
 
 static inline void kaapi_atomic_or(kaapi_atomic_t* a, unsigned long n)
 {
-  __sync_or_and_fetch(&a->value, n);
+  __sync_fetch_and_or(&a->value, n);
 }
 
 static inline void kaapi_atomic_sub(kaapi_atomic_t* a, unsigned long n)
@@ -155,6 +155,13 @@ static inline void kaapi_bitmap_set
 {
   const size_t j = i / (8 * sizeof(unsigned long));
   bitmap->bits[j] |= 1UL << (i % (8 * sizeof(unsigned long)));
+}
+
+static inline void kaapi_bitmap_clear
+(kaapi_bitmap_t* bitmap, size_t i)
+{
+  const size_t j = i / (8 * sizeof(unsigned long));
+  bitmap->bits[j] &= ~(1UL << (i % (8 * sizeof(unsigned long))));
 }
 
 static inline void kaapi_bitmap_dup
@@ -775,6 +782,12 @@ typedef struct kaapi_ws_layer
 /* emit a steal request
  */
 
+static int set_member_req(kaapi_proc_t* proc, void* reqs)
+{
+  kaapi_bitmap_set(reqs, proc->id_word);
+  return 0;
+}
+
 static inline kaapi_ws_groupid_t select_group_victim
 (kaapi_ws_group_t* group)
 {
@@ -801,8 +814,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 
   /* emit the stealing request */
  redo_select:
-  victim_id = kaapi_ws_groupid_to_procid
-    (group, select_group_victim(group));
+  victim_id = kaapi_ws_groupid_to_procid(group, select_group_victim(group));
   if (victim_id == self_proc->id_word)
     goto redo_select;
 
@@ -819,11 +831,13 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 
     if (victim_proc->ws_split_fn != NULL)
     {
-      /* todo_not_implemented
-	 should be a local bitmap being the union of all requests
+      /* to_optimize: store post / reply as bits. knowing
+	 who posted in the group is just a matter or oring
        */
-      victim_proc->ws_split_fn
-	(&group->members, victim_proc->ws_split_data);
+      kaapi_bitmap_t reqs;
+      kaapi_bitmap_zero(&reqs);
+      kaapi_ws_group_foreach(group, set_member_req, &reqs);
+      victim_proc->ws_split_fn(&reqs, victim_proc->ws_split_data);
     }
 
     kaapi_atomic_dec(&victim_proc->ws_split_refn);
@@ -839,11 +853,21 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
     goto on_success;
   }
 
+  /* termination requested */
+  if (kaapi_atomic_read(&self_proc->control_word) == KAAPI_PROC_CONTROL_TERM)
+  {
+    printf("KAAPI_PROC_CONTROL_TERM\n");
+    goto on_failure;
+  }
+
   /* try to lock again */
   goto redo_acquire;
 
  on_success:
   return 0;
+
+ on_failure:
+  return -1;
 }
 
 
@@ -875,6 +899,9 @@ static int kaapi_ws_group_split
     kaapi_lock_acquire(&group->lock);
     kaapi_bitmap_or(&reqs, &group->members);
   }
+
+  /* exclude my request */
+  kaapi_bitmap_clear(&reqs, kaapi_proc_get_self()->id_word);
 
   /* call the splitter */
   split_fn(&reqs, split_data);
@@ -1075,6 +1102,11 @@ static inline void init_foreach_work
 (foreach_work_t* work, double* array, size_t size)
 {
   kaapi_lock_init(&work->lock);
+}
+
+static inline void set_foreach_work
+(foreach_work_t* work, double* array, size_t size)
+{
   work->array = array;
   work->i = 0;
   work->j = size;
@@ -1182,6 +1214,8 @@ static void foreach_common(foreach_work_t* w)
 
   while (extract_seq(w, seq_size, &beg, &end) != -1)
   {
+    printf("[ %u - %u [\n", beg - w->array, end - w->array);
+
     /* termination_hack */
     term_size += end - beg;
 
@@ -1288,7 +1322,7 @@ static int for_foreach
   /* make them steal */
   for (i = 0; i < group_count; ++i) kaapi_ws_group_start(&groups[i]);
 
-  /* make the initial work */
+  /* initialize the work */
   init_foreach_work(&work, array, size);
 
   /* termination_hack */
@@ -1296,12 +1330,17 @@ static int for_foreach
   term_hack.size = size;
   work.term_hack = &term_hack;
 
-  /* initial split amongst the groups */
-  kaapi_ws_group_split(groups, group_count, splitter, &work);
-
   /* run algorithm */
   for (; iter_count; --iter_count)
   {
+    set_foreach_work(&work, array, size);
+
+    if (iter_count == 0)
+    {
+      /* initial split amongst the groups */
+      kaapi_ws_group_split(groups, group_count, splitter, &work);
+    }
+
     printf("----\n");
     foreach_master(&work);
   }
