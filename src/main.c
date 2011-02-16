@@ -87,11 +87,11 @@ static void kaapi_cuda_exec_gpu_thread_entry(void* p)
 
 static void* thread_entry(void* p)
 {
-  kaapi_thread_block_t* const ktb = p;
+  kaapi_processor_block_t* const kpb = p;
 
   while (1)
   {
-    switch (ktb->control_word)
+    switch (kpb->control_word)
     {
     case KAAPI_CONTROL_WORD_NOP:
       break ;
@@ -100,7 +100,17 @@ static void* thread_entry(void* p)
       break ;
 
     case KAAPI_CONTROL_WORD_STEAL:
-      do_steal();
+      switch (kpb->config_word)
+      {
+      case KAAPI_CONFIG_WORD_WS:
+	kaapi_ws_main();
+	break ;
+
+      case KAAPI_CONFIG_WORD_STATIC:
+	kaapi_static_main();
+	break ;
+      }
+
       break ;
 
     case KAAPI_CONTROL_WORD_DONE:
@@ -200,35 +210,6 @@ static void kaapi_topo_create_flat(kaapi_topo_t*)
 static void kaapi_topo_create_numa(kaapi_topo_t*)
 {
 }
-
-
-/* heterogeneous reduce */
-
-typedef unsigned int data_type;
-
-static inline data_type reduce_op(data_type a, data_type b)
-{
-  return a + b;
-}
-
-static data_type reduce_cpu(const data_type*, size_t);
-
-static data_type reduce_cuda(const data_type* array, size_t size)
-{
-  return reduce_cpu(array, size);
-}
-
-static data_type reduce_cpu(const data_type* array, size_t size)
-{
-  data_type res = 0;
-  for (; size; ++array, --size) res = reduce_op(res, *array);
-}
-
-static data_type reduce(const data_type* array, size_t size)
-{
-  
-}
-
 
 /* main */
 

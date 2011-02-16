@@ -1,5 +1,3 @@
-== moca, mopa
-
 --- directory organization
 
 . sched
@@ -30,4 +28,77 @@
 .. kaapi_topo_create_flat
 .. kaapi_topo_create_tree
 
---
+
+-- cuda adaptive processing
+. implementation
+
+
+-- kaapi_workstream_t
+. example/stream
+
+
+-- splitting the work on hierarchical machines
+
+. intro
+ . idfreeze topo
+  . levels: socket, numa, l3
+ . compare xkaapi benchs with pthread on foreach
+
+. problem: in iterative algorithms, the next splitting
+iteration of an algorithm should distribute the data on
+a level <= the current one.
+. solutions
+ . one flat group
+  . currently implemented, does not work well on a classical
+  multicore numa machine
+   . workstealing aims at balancing the load, but not relevant
+   on those machines since processing units are homogeneous
+
+ . static groups
+  . advantages
+   . no need to to keep track of the data site
+  . drawbacks
+   . the initial data distribution needs to be good enough
+  . the workers are organized in a group hierarchy
+   . a worker can steal any worker that is <= its level
+  . needs for an initial data distribution (bootstraping)
+   . either classical workstealing
+    . until convergence criteria met (ie. similar to kmeans)
+   . or rely on a previous allocation scheme
+    . either previous tasks owned the data
+    . or the user can statically bind data to sites
+  . implementation
+
+ . more dynamic groups
+  . problem with static group if data are initially not well distributed
+   . some groups may have more work than others
+   . since no inter group stealing allowed, no load balancing
+   . in this case, the idea is to allow a starving group to steal another one
+    . workers always steal locally
+    . if some threshold (according to some metrics) is reached, steal remotely
+   . difficulty
+    . find the (metrics, threshold)
+    . how much to steal remotely (group size?)
+
+. implementation details
+ . it should be possible to switch the policy dynamically to allow hybrid schemes
+  . do N iterations static then 1 dynamic
+ . provide an initial allocator that distributes equally the data amongst a given
+ workstealing tree
+  . recursive, stops on the first unallocatable node (ie. l3)
+  . assume 
+
+. ideas
+ . build the group layers according to the initial data distribution
+  . query the system to get data location
+
+ . initial distribution
+  . hierarchical: data should not be evicted from the initial level
+   -> use work per group
+  . keep the grouping impelmentation light
+   -> allow to see normal workstealing as the flat, 1 group case
+
+ . C++ interface
+  . ka::group simple_group(1, 2, 4);
+  . ka::sched::enter_adaptive_section(splitter, args, simple_group);
+  . ka::sched::leave_adaptive_section();
