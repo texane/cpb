@@ -918,10 +918,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 
   /* termination requested */
   if (kaapi_atomic_read(&self_proc->control_word) == KAAPI_PROC_CONTROL_TERM)
-  {
-    printf("KAAPI_PROC_CONTROL_TERM\n");
     goto on_failure;
-  }
 
   /* try to lock again */
   goto redo_acquire;
@@ -1086,6 +1083,22 @@ static void kaapi_ws_leave_adaptive
 }
 
 
+/* internal groups construction
+ */
+
+static kaapi_ws_group_t* kaapi_single_groups = NULL;
+static size_t kaapi_single_group_count;
+
+/* todo */
+static kaapi_ws_group_t* kaapi_xx ... 
+
+static int kaapi_create_all_ws_groups(void)
+{}
+
+static void kaapi_destroy_all_ws_groups(void)
+{}
+
+
 /* kaapi constructor, destructor
  */
 
@@ -1237,9 +1250,6 @@ static void splitter
     tw->j = stolen_j;
 
     kaapi_ws_request_reply(req, foreach_thief);
-
-    printf("reply: [%lu - %lu[ to %lu ", tw->i, tw->j, i);
-    kaapi_bitmap_print(req_map);
   }
 
  on_done:
@@ -1451,7 +1461,7 @@ static void fill_array(double* addr, size_t count)
 
 static int check_array(const double* addr, size_t count)
 {
-#define CONFIG_ITER_COUNT 2
+#define CONFIG_ITER_COUNT 10
 
   const size_t saved_count = count;
 
@@ -1474,7 +1484,7 @@ static int check_array(const double* addr, size_t count)
 int main(int ac, char** av)
 {
 /* #define CONFIG_ARRAY_COUNT (1 * 1024 * 1024) */
-#define CONFIG_ARRAY_COUNT (4096)
+#define CONFIG_ARRAY_COUNT (4096 * 1000)
   double* array = NULL;
   size_t count = CONFIG_ARRAY_COUNT;
 

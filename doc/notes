@@ -98,7 +98,37 @@ a level <= the current one.
   . keep the grouping impelmentation light
    -> allow to see normal workstealing as the flat, 1 group case
 
+  . create a group accordingly to the data initial distribution
+   -> choose the thread repartition to minimize the total distance
+   -> kaapi_memtopo_create_group_for_data();
+
  . C++ interface
   . ka::group simple_group(1, 2, 4);
   . ka::sched::enter_adaptive_section(splitter, args, simple_group);
   . ka::sched::leave_adaptive_section();
+
+
+ . todo
+  . the request must be set by group, not by kproc. todo
+
+  . grouping
+   . at initialization, groups are build
+    . core (ie. one group per core), l3, socket, machine (ie. flat)
+   . the processor block contains at most 4 groups
+    . the interpretation is given by specializing the work stealing method
+
+  . hierarchical workstealing
+   . starvation
+    . metric used: missing steal count
+    . one register per proc
+    . reset when a steal succeeds
+    . consider member starvation when ws_failed_reqs >= group->member_count
+    . consider group starvation when every member starving
+
+   . leader selection
+    . the one who acquires the lock test for starvation
+
+   . hierarchy implementation
+    . groups[4]
+    . if (lock_acquire() && starving_group())
+       hierarhical_stealing(current_group = 
