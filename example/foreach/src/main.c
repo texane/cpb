@@ -1,3 +1,6 @@
+#define _GNU_SOURCE 1
+#include <sched.h>
+
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -63,7 +66,23 @@ static inline void kaapi_atomic_dec(kaapi_atomic_t* a)
 
 static inline void kaapi_mem_write_barrier(void)
 {
+  /* todo_optimize */
   __sync_synchronize();
+}
+
+static inline void kaapi_mem_read_barrier(void)
+{
+  /* todo_optimize */
+  __sync_synchronize();
+}
+
+
+/* slow the cpu down
+ */
+
+static void inline kaapi_cpu_slowdown(void)
+{
+  __asm__ __volatile__ ("pause\n\t");
 }
 
 
@@ -89,7 +108,7 @@ static inline unsigned int kaapi_lock_try_acquire(kaapi_lock_t* l)
 static inline void kaapi_lock_acquire(kaapi_lock_t* l)
 {
   while (kaapi_lock_try_acquire(l) == 0)
-    __asm__ __volatile__ ("pause\n\t");
+    kaapi_cpu_slowdown();
 }
 
 static void kaapi_lock_release(kaapi_lock_t* l)
@@ -204,15 +223,17 @@ static int kaapi_numa_bind
 /* workstealing request outcome
  */
 
+typedef void (*kaapi_ws_execfn_t)(void*);
+
 typedef struct kaapi_ws_work
 {
-  void (*execfn)(void*);
-  void* data;
+  kaapi_ws_execfn_t exec_fn;
+  void* exec_data;
 } kaapi_ws_work_t;
 
 static inline void kaapi_ws_work_exec(kaapi_ws_work_t* w)
 {
-  w->execfn(w->data);
+  w->exec_fn(w->exec_data);
 }
 
 
@@ -229,7 +250,7 @@ typedef struct kaapi_ws_request
   kaapi_atomic_t status;
 
   /* replied data */
-  void (* volatile execfn)(void*);
+  volatile kaapi_ws_execfn_t exec_fn;
   volatile size_t data_size;
   volatile unsigned char data[256];
 
@@ -244,8 +265,9 @@ static void kaapi_ws_request_post
 }
 
 static inline void kaapi_ws_request_reply
-(kaapi_ws_request_t* req)
+(kaapi_ws_request_t* req, kaapi_ws_execfn_t exec_fn)
 {
+  req->exec_fn = exec_fn;
   kaapi_mem_write_barrier();
   kaapi_atomic_or(&req->status, KAAPI_WS_REQUEST_REPLIED);
 }
@@ -276,7 +298,7 @@ static inline void* kaapi_ws_request_alloc_data
 /* kaapi processors
  */
 
-typedef void (*kaapi_ws_splitfn_t)(void*);
+typedef void (*kaapi_ws_splitfn_t)(const kaapi_bitmap_t*, void*);
 
 struct kaapi_ws_group;
 
@@ -299,7 +321,7 @@ typedef struct kaapi_proc
   /* current adaptive task */
   kaapi_atomic_t ws_split_refn;
   volatile kaapi_ws_splitfn_t ws_split_fn;
-  volatile void* ws_split_data;
+  void* volatile ws_split_data;
 
   /* workstealing */
   struct kaapi_ws_group* ws_group;
@@ -374,6 +396,7 @@ static void* kaapi_proc_thread_entry(void* p)
 
   kaapi_proc_t* const self_proc = kaapi_proc_alloc(args->id);
 
+  kaapi_proc_init(self_proc, args->id);
   pthread_setspecific(kaapi_proc_key, self_proc);
   kaapi_all_procs[args->id] = self_proc;
   kaapi_mem_write_barrier();
@@ -449,6 +472,7 @@ static size_t kaapi_memtopo_count_groups
   return group_count_bylevel[level];
 }
 
+__attribute__((unused))
 static size_t kaapi_memtopo_get_size
 (unsigned int level)
 {
@@ -458,11 +482,12 @@ static size_t kaapi_memtopo_get_size
 
 static int kaapi_memtopo_get_group_members
 (
- kaapi_bitmap_t* members, size_t count,
+ kaapi_bitmap_t* members, size_t* count,
  unsigned int level,
  unsigned int group_index
 )
 {
+  /* todo_not_implemented */
   return -1;
 }
 
@@ -543,11 +568,11 @@ typedef struct kaapi_ws_group
 
 /* group local id
  */
-typedef unsigned long kaapi_groupid_t;
+typedef unsigned long kaapi_ws_groupid_t;
 
 
 static inline kaapi_procid_t kaapi_ws_groupid_to_procid
-(kaapi_ws_group_t* group, kaapi_groupid_t id)
+(kaapi_ws_group_t* group, kaapi_ws_groupid_t id)
 {
   return (kaapi_procid_t)kaapi_bitmap_pos(&group->members, (size_t)id);
 }
@@ -555,6 +580,8 @@ static inline kaapi_procid_t kaapi_ws_groupid_to_procid
 
 /* group allocation routines
  */
+
+__attribute__((unused))
 static kaapi_ws_group_t* kaapi_ws_group_create(size_t member_count)
 {
 #if 0 /* todo_not_implemented */
@@ -596,7 +623,7 @@ static int kaapi_ws_create_mem_groups
 {
   size_t i;
 
-  *group_count = kaapi_memtopo_count_groups_at(level);
+  *group_count = kaapi_memtopo_count_groups(level);
   if (*group_count == 0) return -1;
 
   *groups = malloc((*group_count) * sizeof(kaapi_ws_group_t));
@@ -604,7 +631,7 @@ static int kaapi_ws_create_mem_groups
 
   for (i = 0; i < *group_count; ++i)
   {
-    kaapi_ws_group_t* const group = (*groups)[i];
+    kaapi_ws_group_t* const group = &(*groups)[i];
     kaapi_memtopo_get_group_members
       (&group->members, &group->member_count, level, i);
   }
@@ -644,16 +671,14 @@ typedef struct kaapi_ws_layer
 #endif /* todo_not_implemented */
 
 
-static kaapi_ws_groupid_t select_group_victim(kaapi_ws_group_t* group)
-{
-  /* return the absolute kproc index */
-
-  return (kaapi_ws_groupid_t)(rand() % group->member_count);
-}
-
-
 /* emit a steal request
  */
+
+static inline kaapi_ws_groupid_t select_group_victim
+(kaapi_ws_group_t* group)
+{
+  return (kaapi_ws_groupid_t)(rand() % group->member_count);
+}
 
 static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 {
@@ -668,41 +693,42 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
    */
 
   kaapi_proc_t* const self_proc = kaapi_proc_get_self();
-  kaapi_ws_group_t* const group = self_proc->group;
+  kaapi_ws_group_t* const group = self_proc->ws_group;
+  kaapi_ws_request_t* const self_req = &self_proc->ws_request;
 
   kaapi_procid_t victim_id;
-  kaapi_proc_t* victim_proc;
-  int error = -1;
 
   /* emit the stealing request */
-  victim_id = kaapi_ws_groupid_to_procid(group, select_victim(group));
-  kaapi_ws_request_post(&self_proc->ws_request, victim_procid);
+  victim_id = kaapi_ws_groupid_to_procid
+    (group, select_group_victim(group));
+  kaapi_ws_request_post(self_req, victim_id);
 
  redo_acquire:
   if (kaapi_lock_try_acquire(&group->lock))
   {
-    /* success, split amongst the group members */
-    const kaapi_procid_t victim_procid =
-      kaapi_ws_groupid_to_procid(group, groupid);
+    kaapi_proc_t* const victim_proc = kaapi_all_procs[victim_id];
 
     kaapi_atomic_inc(&victim_proc->ws_split_refn);
 
     if (victim_proc->ws_split_fn != NULL)
     {
-      /* todo_not_implemented */
-      victim_proc->ws_split_fn(group->members);
+      /* todo_not_implemented
+	 should be a local bitmap being the union of all requests
+       */
+      victim_proc->ws_split_fn
+	(&group->members, victim_proc->ws_split_data);
     }
 
     kaapi_atomic_dec(&victim_proc->ws_split_refn);
 
-    kaapi_lock_unlock(&group->lock);
+    kaapi_lock_release(&group->lock);
   } /* try_acquire */
 
   /* test our own request */
   if (kaapi_ws_request_test_ack(&self_proc->ws_request))
   {
-    work->execfn = self_req->execfn;
-    work->data = self_req->data;
+    work->exec_fn = self_req->exec_fn;
+    work->exec_data = (void*)self_req->data;
     goto on_success;
   }
 
@@ -710,10 +736,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   goto redo_acquire;
 
  on_success:
-  error = 0;
-
- on_failure:
-  return error;
+  return 0;
 }
 
 
@@ -722,7 +745,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 static int kaapi_ws_group_split
 (
  kaapi_ws_group_t* groups, size_t group_count,
- kaapi_ws_splitfn_t splitfn, void* data
+ kaapi_ws_splitfn_t split_fn, void* split_data
 )
 {
   /* this function must not be called concurrently with
@@ -741,18 +764,18 @@ static int kaapi_ws_group_split
   /* lock all the groups */
   for (i = 0; i < group_count; ++i)
   {
-    kaapi_ws_group_t* const group = groups[i];
+    kaapi_ws_group_t* const group = &groups[i];
     kaapi_lock_acquire(&group->lock);
     kaapi_bitmap_or(&reqs, &group->members);
   }
 
   /* call the splitter */
-  splitfn(&reqs);
+  split_fn(&reqs, split_data);
 
   /* unlock groups */
   for (i = 0; i < group_count; ++i)
   {
-    kaapi_ws_group_t* const group = groups[i];
+    kaapi_ws_group_t* const group = &groups[i];
     kaapi_lock_release(&group->lock);
   }
 
@@ -772,13 +795,12 @@ static int kaapi_ws_start_groups
   pthread_attr_t attr;
   pthread_t thread;
   kaapi_bitmap_t all_members;
-  kaapi_proc_t* proc;
   int error = -1;
   size_t i;
   size_t all_count;
   cpu_set_t cpuset;
 
-  kaapi_proc_args_t args[KAAPI_PROC_COUNT];
+  kaapi_proc_args_t args[CONFIG_PROC_COUNT];
 
   pthread_attr_init(&attr);
 
@@ -786,18 +808,10 @@ static int kaapi_ws_start_groups
   kaapi_bitmap_zero(&all_members);
   for (i = 0; i < group_count; ++i)
   {
-    kaapi_ws_group_t* const group = groups[i];
+    kaapi_ws_group_t* const group = &groups[i];
 
     /* add group members to the member set */
     kaapi_bitmap_or(&all_members, &group->members);
-
-    /* foreach member, create a thread */
-    while (kaapi_bitmap_is_empty(&members) == 0)
-    {
-      /* get the member */
-      const size_t pos = kaapi_bitmap_next(&members);
-      kaapi_bitmap_clear(&members, pos);
-    }
   }
 
   all_count = kaapi_bitmap_count(&all_members);
@@ -819,8 +833,9 @@ static int kaapi_ws_start_groups
       pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
       sched_yield();
       kaapi_all_procs[0] = kaapi_proc_alloc(0);
+      kaapi_proc_init(kaapi_all_procs[0], 0);
       pthread_setspecific(kaapi_proc_key, kaapi_all_procs[0]);
-      goto next_member;
+      continue ; /* next member */
     }
 
     /* create thread bound on the ith processor */
@@ -850,23 +865,23 @@ static int kaapi_ws_start_groups
 static void kaapi_ws_enter_adaptive
 (kaapi_proc_t* proc, kaapi_ws_splitfn_t fn, void* data)
 {
-  proc->ws_data = data;
+  proc->ws_split_data = data;
   kaapi_mem_write_barrier();
   proc->ws_split_fn = fn;
 }
 
-static void kaapi_ws_leave_adpative
+static void kaapi_ws_leave_adaptive
 (kaapi_proc_t* proc)
 {
   /* todo: wait for unused splitter */
 
-  proc->ws_splitfn = NULL;
+  proc->ws_split_fn = NULL;
 
   kaapi_mem_write_barrier();
 
   /* wait for no one using the splitter */
-  while (kaapi_atomic_read(&proc->ws_refn))
-    ;
+  while (kaapi_atomic_read(&proc->ws_split_refn))
+    kaapi_cpu_slowdown();
 }
 
 
@@ -906,8 +921,24 @@ typedef struct foreach_work
 
 } foreach_work_t;
 
+static inline void init_foreach_work
+(
+ foreach_work_t* work,
+ double* array, size_t size,
+ kaapi_atomic_t* counter
+)
+{
+  work->counter = counter;
+  kaapi_lock_init(&work->lock);
+  work->array = array;
+  work->i = 0;
+  work->j = size;
+}
+
+static void foreach_thief(void*);
+
 static void splitter
-(kaapi_bitmap_t* req_map, void* arg)
+(const kaapi_bitmap_t* req_map, void* arg)
 {
   /* one splitter for both initial, grouped
      and task emitted requests. this is left
@@ -922,6 +953,7 @@ static void splitter
   size_t unit_size;
   size_t work_size;
   size_t stolen_j;
+  size_t i;
 
   req_count = kaapi_bitmap_count(req_map);
   if (req_count == 0) goto on_done;
@@ -936,29 +968,27 @@ static void splitter
     unit_size = 1;
   }
 
-  vw->j -= req_count * unit_size;
   stolen_j = vw->j;
+  vw->j -= req_count * unit_size;
 
   kaapi_lock_release(&vw->lock);
 
-  for (i = 0; i != (size_t)-1; ++i, j -= unit_size)
+  i = kaapi_bitmap_scan(req_map, 0);
+  for (; i != (size_t)-1; stolen_j -= unit_size)
   {
-    i = kaapi_bitmap_scan(&all_members, 0);
-    if (i == (size_t)-1) break ;
-
     req = kaapi_proc_get_ws_request((kaapi_procid_t)i);
 
     tw = kaapi_ws_request_alloc_data(req, sizeof(foreach_work_t));
     tw->counter = vw->counter;
     kaapi_lock_init(&tw->lock);
     tw->array = vw->array;
-    tw->i = j - unit_size;
-    tw->j = j;
+    tw->i = stolen_j - unit_size;
+    tw->j = stolen_j;
 
-    kaapi_ws_request_reply(req);
+    kaapi_ws_request_reply(req, foreach_thief);
 
     /* next_request */
-    i = kaapi_bitmap_scan(&req_map, i);
+    i = kaapi_bitmap_scan(req_map, i + 1);
   }
 
  on_done:
@@ -1003,37 +1033,27 @@ static void foreach_common(foreach_work_t* w)
 static void foreach_thief(void* p)
 {
   kaapi_proc_t* const self_proc = kaapi_proc_get_self();
-  foreach_work_t* const w = p;
+  foreach_work_t* const work = p;
 
-  kaapi_ws_enter_adaptive(self_proc, splitter, &work);
-  foreach_common(w);
-  kaapi_ws_leave_adpative(self_proc);
+  kaapi_ws_enter_adaptive(self_proc, splitter, work);
+  foreach_common(work);
+  kaapi_ws_leave_adaptive(self_proc);
 }
 
 
-static void foreach_master(double* array, size_t size)
+static void foreach_master(foreach_work_t* work)
 {
   /* inplace foreach */
 
   kaapi_proc_t* const self_proc = kaapi_proc_get_self();
 
-  kaapi_atomic_t counter;
-  foreach_work_t work;
-
-  kaapi_atomic_write(&counter, size);
-  work.counter = &counter;
-  kaapi_lock_init(&work.lock);
-  work.array = array;
-  work.i = 0;
-  work.j = size;
-
-  kaapi_ws_enter_adaptive(self_proc, splitter, &work);
-  foreach_common(&work);
+  kaapi_ws_enter_adaptive(self_proc, splitter, work);
+  foreach_common(work);
   kaapi_ws_leave_adaptive(self_proc);
 
   /* wait for the thieves to end */
-  while (kaapi_atomic_read(&counter))
-    ;
+  while (kaapi_atomic_read(work->counter))
+    kaapi_cpu_slowdown();
 }
 
 
@@ -1042,11 +1062,15 @@ static int for_foreach
 {
   int error = -1;
 
+  /* work descriptor */
+  kaapi_atomic_t counter;
+  foreach_work_t work;
+
   /* create the socket groups */
   const size_t total_size = size * sizeof(double);
   const unsigned int mem_level = KAAPI_MEMTOPO_LEVEL_SOCKET;
 
-  kaapi_ws_group_t* mem_groups = NULL;
+  kaapi_ws_group_t* groups = NULL;
   size_t group_count;
 
   if (kaapi_ws_create_mem_groups(&groups, &group_count, mem_level))
@@ -1057,13 +1081,17 @@ static int for_foreach
     goto on_error;
 
   /* bind memory uniformly amongst group members */
-  kaapi_memtopo_bind_uniform_at(addr, total_size, level);
+  kaapi_memtopo_bind_uniform(array, total_size, mem_level);
+
+  /* make the initial work */
+  kaapi_atomic_write(&counter, 0);
+  init_foreach_work(&work, array, size, &counter);
 
   /* initial split amongst the groups */
-  kaapi_ws_group_split(groups, group_count, group_splitter);
+  kaapi_ws_group_split(groups, group_count, splitter, &work);
 
   /* run algorithm */
-  for (; iter_count; --iter_count) foreach(array, size);
+  for (; iter_count; --iter_count) foreach_master(&work);
 
   /* success */
   error = 0;
@@ -1107,7 +1135,7 @@ int main(int ac, char** av)
 
   kaapi_initialize();
 
-  allocate_array(&array, count * sizeof(double));
+  allocate_array((void**)&array, count * sizeof(double));
 
   /* so that pages are bound on the current core */
   fill_array(array, count * sizeof(double));
