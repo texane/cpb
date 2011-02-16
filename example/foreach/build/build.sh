@@ -3,11 +3,16 @@
 NUMA_CFLAGS=-DCONFIG_USE_NUMA=1
 NUMA_LDFLAGS=-lnuma
 
-# NUMA_CFLAGS=-DCONFIG_USE_NUMA=0
-# NUMA_LDFLAGS=
-
-gcc -Wall -O3 -march=native -Wall \
+gcc -Wall -O3 -march=native \
 $NUMA_CFLAGS \
+-o foreach_release \
 ../src/main.c \
 -lpthread \
-$NUMA_LDFLAGS \
+$NUMA_LDFLAGS
+
+gcc -ggdb \
+$NUMA_CFLAGS \
+-o foreach_debug \
+../src/main.c \
+-lpthread \
+$NUMA_LDFLAGS

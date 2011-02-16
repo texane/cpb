@@ -78,6 +78,64 @@ static inline void kaapi_atomic_dec
 }
 
 
+/* slow the cpu down
+ */
+
+static void inline kaapi_cpu_slowdown(void)
+{
+  __asm__ __volatile__ ("pause\n\t");
+}
+
+
+/* ref couting
+ */
+
+typedef kaapi_atomic_t kaapi_refn_t;
+
+static inline void kaapi_refn_init(kaapi_refn_t* refn)
+{
+  kaapi_atomic_write(refn, 0);
+}
+
+static int kaapi_refn_get(kaapi_refn_t* refn)
+{
+  unsigned long value;
+  unsigned long prev_value;
+
+  value = kaapi_atomic_read(refn);
+  while (value)
+  {
+    prev_value = __sync_val_compare_and_swap
+      (&refn->value, value, value + 1);
+
+    /* success */
+    if (prev_value == value) return 0;
+
+    value = prev_value;
+  }
+
+  return -1;
+}
+
+static inline void kaapi_refn_put(kaapi_refn_t* refn)
+{
+  kaapi_atomic_dec(refn);
+}
+
+static inline void kaapi_refn_set(kaapi_refn_t* refn)
+{
+  /* force the initial value */
+  kaapi_atomic_write(refn, 1);
+}
+
+static inline void kaapi_refn_wait(kaapi_refn_t* refn)
+{
+  /* wait for refn to drop to 0 */
+  while (kaapi_atomic_read(refn))
+    kaapi_cpu_slowdown();
+}
+
+
 /* memory ordering
  */
 
@@ -91,15 +149,6 @@ static inline void kaapi_mem_read_barrier(void)
 {
   /* todo_optimize */
   __sync_synchronize();
-}
-
-
-/* slow the cpu down
- */
-
-static void inline kaapi_cpu_slowdown(void)
-{
-  __asm__ __volatile__ ("pause\n\t");
 }
 
 
@@ -377,7 +426,7 @@ typedef struct kaapi_proc
   kaapi_atomic_t status_word;
 
   /* current adaptive task */
-  kaapi_atomic_t ws_split_refn;
+  kaapi_refn_t ws_split_refn;
   volatile kaapi_ws_splitfn_t ws_split_fn;
   void* volatile ws_split_data;
 
@@ -429,8 +478,7 @@ static void kaapi_proc_init(kaapi_proc_t* proc, kaapi_procid_t id)
   kaapi_atomic_write(&proc->control_word, KAAPI_PROC_CONTROL_UNDEF);
   kaapi_atomic_write(&proc->status_word, KAAPI_PROC_STATUS_UNDEF);
 
-  kaapi_atomic_write(&proc->ws_split_refn, 0);
-  proc->ws_split_fn = NULL;
+  kaapi_refn_init(&proc->ws_split_refn);
 
   proc->ws_group = NULL;
 
@@ -838,25 +886,26 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   {
     kaapi_proc_t* const victim_proc = kaapi_proc_byid(victim_id);
 
-    kaapi_atomic_inc(&victim_proc->ws_split_refn);
-
-    if (victim_proc->ws_split_fn != NULL)
+    if (kaapi_refn_get(&victim_proc->ws_split_refn) != -1)
     {
-      /* to_optimize: store post / reply as bits. knowing
+      /* todo_optimize: store post / reply as bits. knowing
 	 who posted in the group is just a matter or oring
        */
+
       kaapi_bitmap_t reqs;
       size_t req_count;
 
       kaapi_bitmap_zero(&reqs);
       kaapi_ws_group_foreach(group, set_member_req, &reqs);
       req_count = kaapi_bitmap_count(&reqs);
-      victim_proc->ws_split_fn(&reqs, req_count, victim_proc->ws_split_data);
+      victim_proc->ws_split_fn
+	(&reqs, req_count, victim_proc->ws_split_data);
     }
 
-    kaapi_atomic_dec(&victim_proc->ws_split_refn);
+    kaapi_refn_put(&victim_proc->ws_split_refn);
 
     kaapi_lock_release(&group->lock);
+
   } /* try_acquire */
 
   /* test our own request */
@@ -1018,26 +1067,22 @@ static int kaapi_ws_spawn_groups
 
 /* adaptive code section
  */
+
 static void kaapi_ws_enter_adaptive
 (kaapi_proc_t* proc, kaapi_ws_splitfn_t fn, void* data)
 {
   proc->ws_split_data = data;
-  kaapi_mem_write_barrier();
   proc->ws_split_fn = fn;
+  kaapi_mem_write_barrier();
+
+  kaapi_refn_set(&proc->ws_split_refn);
 }
 
 static void kaapi_ws_leave_adaptive
 (kaapi_proc_t* proc)
 {
-  /* todo: wait for unused splitter */
-
-  proc->ws_split_fn = NULL;
-
-  kaapi_mem_write_barrier();
-
-  /* wait for no one using the splitter */
-  while (kaapi_atomic_read(&proc->ws_split_refn))
-    kaapi_cpu_slowdown();
+  kaapi_refn_put(&proc->ws_split_refn);
+  kaapi_refn_wait(&proc->ws_split_refn);
 }
 
 
@@ -1175,7 +1220,7 @@ static void splitter
 
   kaapi_lock_release(&vw->lock);
 
-  if (req_count) printf("req_count: %u\n", req_count);
+  if (req_count) printf("req_count: %lu\n", req_count);
 
   for (i = 0; req_count; stolen_j -= unit_size, ++i, --req_count)
   {
@@ -1193,7 +1238,7 @@ static void splitter
 
     kaapi_ws_request_reply(req, foreach_thief);
 
-    printf("reply: [%u - %u[ to %u ", tw->i, tw->j, i);
+    printf("reply: [%lu - %lu[ to %lu ", tw->i, tw->j, i);
     kaapi_bitmap_print(req_map);
   }
 
@@ -1240,7 +1285,9 @@ static void foreach_common(foreach_work_t* w)
 
   while (extract_seq(w, seq_size, &beg, &end) != -1)
   {
-    printf("%lu [ %u - %u [\n", kaapi_proc_get_self()->id_word, beg - w->array, end - w->array);
+#if 0
+    printf("%lu [ %lu - %lu [\n", kaapi_proc_get_self()->id_word, beg - w->array, end - w->array);
+#endif
 
     /* termination_hack */
     term_size += end - beg;
@@ -1412,7 +1459,7 @@ static int check_array(const double* addr, size_t count)
   {
     if (*addr != CONFIG_ITER_COUNT)
     {
-      printf("INVALID_ARRAY @%u == %lf\n", saved_count - count, *addr);
+      printf("INVALID_ARRAY @%lu == %lf\n", saved_count - count, *addr);
       return -1;
     }
   }
@@ -1427,7 +1474,7 @@ static int check_array(const double* addr, size_t count)
 int main(int ac, char** av)
 {
 /* #define CONFIG_ARRAY_COUNT (1 * 1024 * 1024) */
-#define CONFIG_ARRAY_COUNT (512)
+#define CONFIG_ARRAY_COUNT (4096)
   double* array = NULL;
   size_t count = CONFIG_ARRAY_COUNT;
 
