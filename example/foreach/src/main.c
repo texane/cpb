@@ -555,13 +555,13 @@ typedef struct kaapi_ws_group
   kaapi_lock_t lock;
 
   /* one bit per physical member */
+  size_t member_count;
   kaapi_bitmap_t members;
 
   /* procid mapping */
 #define KAAPI_WS_GROUP_CONTIGUOUS (1UL << 0)
   unsigned int flags;
   kaapi_procid_t first_procid;
-  size_t member_count;
 
 } kaapi_ws_group_t;
 
@@ -581,43 +581,20 @@ static inline kaapi_procid_t kaapi_ws_groupid_to_procid
 /* group allocation routines
  */
 
-__attribute__((unused))
-static kaapi_ws_group_t* kaapi_ws_group_create(size_t member_count)
+static inline void kaapi_ws_group_init(kaapi_ws_group_t* group)
 {
-#if 0 /* todo_not_implemented */
-
-  const size_t total_size =
-    offsetof(kaapi_ws_group_t, reqs) + member_count * sizeof(kaapi_ws_request_t);
-
-  kaapi_ws_group_t* const group = malloc(total_size);
-  if (group == NULL) return NULL;
-
   kaapi_lock_init(&group->lock);
   group->flags = 0;
-  group->member_count = member_count;
+  group->member_count = 0;
   kaapi_bitmap_zero(&group->members);
-
-  return group;
-
-#else
-
-  return NULL;
-
-#endif /* todo_not_implemented */
 }
-
-static inline void kaapi_ws_group_destroy
-(kaapi_ws_group_t* group)
-{
-  free(group);
-}
-
 
 
 /* build a workstealing group set according
    to the machine memory topology and a level.
    return **groups an array of *group_count members
  */
+
 static int kaapi_ws_create_mem_groups
 (kaapi_ws_group_t** groups, size_t* group_count, unsigned int level)
 {
@@ -632,11 +609,20 @@ static int kaapi_ws_create_mem_groups
   for (i = 0; i < *group_count; ++i)
   {
     kaapi_ws_group_t* const group = &(*groups)[i];
+
+    kaapi_ws_group_init(group);
+
     kaapi_memtopo_get_group_members
       (&group->members, &group->member_count, level, i);
   }
 
   return 0;
+}
+
+static void kaapi_ws_destroy_mem_groups
+(kaapi_ws_group_t* groups, size_t group_count)
+{
+  free(groups);
 }
 
 
@@ -1097,7 +1083,8 @@ static int for_foreach
   error = 0;
 
  on_error:
-  if (groups != NULL) free(groups);
+  if (groups != NULL)
+    kaapi_ws_destroy_mem_groups(groups, group_count);
 
   return error;
 }
@@ -1106,21 +1093,23 @@ static int for_foreach
 /* array helpers
  */
 
-static int allocate_array(void** addr, size_t count)
+static int allocate_array(double** addr, size_t count)
 {
-  /* todo_not_implemented */
-  return -1;
+  const size_t total_size = sizeof(double) * count;
+  if (posix_memalign((void**)addr, CONFIG_PAGE_SIZE, total_size))
+    return -1;
+  return 0;
 }
 
-static int free_array(void* addr, size_t count)
+static void free_array(double* addr, size_t count)
 {
-  /* todo_not_implemented */
-  return -1;
+  free(addr);
 }
 
-static void fill_array(void* addr, size_t size)
+static void fill_array(double* addr, size_t count)
 {
-  memset(addr, 0, size);
+  const size_t total_size = sizeof(double) * count;
+  memset(addr, 0, total_size);
 }
 
 
@@ -1135,7 +1124,7 @@ int main(int ac, char** av)
 
   kaapi_initialize();
 
-  allocate_array((void**)&array, count * sizeof(double));
+  allocate_array(&array, count * sizeof(double));
 
   /* so that pages are bound on the current core */
   fill_array(array, count * sizeof(double));
