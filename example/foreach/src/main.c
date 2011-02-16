@@ -35,37 +35,44 @@ typedef struct kaapi_atomic
   volatile unsigned long value;
 } kaapi_atomic_t;
 
-static inline unsigned long kaapi_atomic_read(kaapi_atomic_t* a)
+static inline unsigned long kaapi_atomic_read
+(const kaapi_atomic_t* a)
 {
   return a->value;
 }
 
-static inline void kaapi_atomic_write(kaapi_atomic_t* a, unsigned long n)
+static inline void kaapi_atomic_write
+(kaapi_atomic_t* a, unsigned long n)
 {
   a->value = n;
 }
 
-static inline void kaapi_atomic_or(kaapi_atomic_t* a, unsigned long n)
+static inline void kaapi_atomic_or
+(kaapi_atomic_t* a, unsigned long n)
 {
   __sync_fetch_and_or(&a->value, n);
 }
 
-static inline void kaapi_atomic_sub(kaapi_atomic_t* a, unsigned long n)
+static inline void kaapi_atomic_sub
+(kaapi_atomic_t* a, unsigned long n)
 {
   __sync_fetch_and_sub(&a->value, n);
 }
 
-static inline void kaapi_atomic_add(kaapi_atomic_t* a, unsigned long n)
+static inline void kaapi_atomic_add
+(kaapi_atomic_t* a, unsigned long n)
 {
   __sync_fetch_and_add(&a->value, n);
 }
 
-static inline void kaapi_atomic_inc(kaapi_atomic_t* a)
+static inline void kaapi_atomic_inc
+(kaapi_atomic_t* a)
 {
   kaapi_atomic_add(a, 1);
 }
 
-static inline void kaapi_atomic_dec(kaapi_atomic_t* a)
+static inline void kaapi_atomic_dec
+(kaapi_atomic_t* a)
 {
   kaapi_atomic_sub(a, 1);
 }
@@ -300,6 +307,13 @@ typedef struct kaapi_ws_request
 
 } kaapi_ws_request_t;
 
+static inline unsigned int kaapi_ws_request_is_posted
+(const kaapi_ws_request_t* req)
+{
+  /* return a boolean value */
+  return kaapi_atomic_read(&req->status) & KAAPI_WS_REQUEST_POSTED;
+}
+
 static void kaapi_ws_request_post
 (kaapi_ws_request_t* req, kaapi_procid_t victim_id)
 {
@@ -342,7 +356,7 @@ static inline void* kaapi_ws_request_alloc_data
 /* kaapi processors
  */
 
-typedef void (*kaapi_ws_splitfn_t)(const kaapi_bitmap_t*, void*);
+typedef void (*kaapi_ws_splitfn_t)(const kaapi_bitmap_t*, size_t, void*);
 
 struct kaapi_ws_group;
 
@@ -481,10 +495,7 @@ static void* kaapi_proc_thread_entry(void* p)
       {
 	kaapi_ws_work_t work;
 	if (kaapi_ws_steal_work(&work) != -1)
-	{
-	  printf("work stolen\n");
 	  kaapi_ws_work_exec(&work);
-	}
 	break ;
       }
 
@@ -784,7 +795,9 @@ typedef struct kaapi_ws_layer
 
 static int set_member_req(kaapi_proc_t* proc, void* reqs)
 {
-  kaapi_bitmap_set(reqs, proc->id_word);
+  if (kaapi_ws_request_is_posted(&proc->ws_request))
+    kaapi_bitmap_set(reqs, proc->id_word);
+
   return 0;
 }
 
@@ -818,8 +831,6 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   if (victim_id == self_proc->id_word)
     goto redo_select;
 
-  printf("victim_id: %lu\n", victim_id);
-
   kaapi_ws_request_post(self_req, victim_id);
 
  redo_acquire:
@@ -835,9 +846,12 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 	 who posted in the group is just a matter or oring
        */
       kaapi_bitmap_t reqs;
+      size_t req_count;
+
       kaapi_bitmap_zero(&reqs);
       kaapi_ws_group_foreach(group, set_member_req, &reqs);
-      victim_proc->ws_split_fn(&reqs, victim_proc->ws_split_data);
+      req_count = kaapi_bitmap_count(&reqs);
+      victim_proc->ws_split_fn(&reqs, req_count, victim_proc->ws_split_data);
     }
 
     kaapi_atomic_dec(&victim_proc->ws_split_refn);
@@ -888,6 +902,7 @@ static int kaapi_ws_group_split
   */
 
   kaapi_bitmap_t reqs;
+  size_t req_count;
   size_t i;
 
   kaapi_bitmap_zero(&reqs);
@@ -900,11 +915,10 @@ static int kaapi_ws_group_split
     kaapi_bitmap_or(&reqs, &group->members);
   }
 
-  /* exclude my request */
+  /* exclude my request, call the splitter */
   kaapi_bitmap_clear(&reqs, kaapi_proc_get_self()->id_word);
-
-  /* call the splitter */
-  split_fn(&reqs, split_data);
+  req_count = kaapi_bitmap_count(&reqs);
+  split_fn(&reqs, req_count, split_data);
 
   /* unlock groups */
   for (i = 0; i < group_count; ++i)
@@ -1115,7 +1129,7 @@ static inline void set_foreach_work
 static void foreach_thief(void*);
 
 static void splitter
-(const kaapi_bitmap_t* req_map, void* arg)
+(const kaapi_bitmap_t* req_map, size_t req_count, void* arg)
 {
   /* one splitter for both initial, grouped
      and task emitted requests. this is left
@@ -1126,23 +1140,34 @@ static void splitter
 
   foreach_work_t* tw;
   kaapi_ws_request_t* req;
-  size_t req_count;
   size_t unit_size;
   size_t work_size;
   size_t stolen_j;
   size_t i;
 
-  req_count = kaapi_bitmap_count(req_map);
   if (req_count == 0) goto on_done;
 
   kaapi_lock_acquire(&vw->lock);
 
+#define CONFIG_PAR_GRAIN 32
+
   work_size = vw->j - vw->i;
+
   unit_size = work_size / (req_count + 1);
-  if (unit_size == 0)
+  if (unit_size < CONFIG_PAR_GRAIN)
   {
-    req_count = work_size - 1;
-    unit_size = 1;
+    req_count = work_size / CONFIG_PAR_GRAIN;
+    if (req_count <= 1)
+    {
+      /* split failure */
+      kaapi_lock_release(&vw->lock);
+      return ;
+    }
+
+    /* let a unit for the seq */
+    req_count -= 1;
+
+    unit_size = CONFIG_PAR_GRAIN;
   }
 
   stolen_j = vw->j;
@@ -1168,7 +1193,8 @@ static void splitter
 
     kaapi_ws_request_reply(req, foreach_thief);
 
-    printf("reply: [%u - %u[ to %u\n", tw->i, tw->j, i);
+    printf("reply: [%u - %u[ to %u ", tw->i, tw->j, i);
+    kaapi_bitmap_print(req_map);
   }
 
  on_done:
@@ -1214,7 +1240,7 @@ static void foreach_common(foreach_work_t* w)
 
   while (extract_seq(w, seq_size, &beg, &end) != -1)
   {
-    printf("[ %u - %u [\n", beg - w->array, end - w->array);
+    printf("%lu [ %u - %u [\n", kaapi_proc_get_self()->id_word, beg - w->array, end - w->array);
 
     /* termination_hack */
     term_size += end - beg;
@@ -1331,11 +1357,11 @@ static int for_foreach
   work.term_hack = &term_hack;
 
   /* run algorithm */
-  for (; iter_count; --iter_count)
+  for (i = 0; i < iter_count; ++i)
   {
     set_foreach_work(&work, array, size);
 
-    if (iter_count == 0)
+    if (i == 0)
     {
       /* initial split amongst the groups */
       kaapi_ws_group_split(groups, group_count, splitter, &work);
@@ -1376,6 +1402,24 @@ static void fill_array(double* addr, size_t count)
   memset(addr, 0, total_size);
 }
 
+static int check_array(const double* addr, size_t count)
+{
+#define CONFIG_ITER_COUNT 2
+
+  const size_t saved_count = count;
+
+  for (; count; ++addr, --count)
+  {
+    if (*addr != CONFIG_ITER_COUNT)
+    {
+      printf("INVALID_ARRAY @%u == %lf\n", saved_count - count, *addr);
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
 
 /* main
  */
@@ -1394,7 +1438,9 @@ int main(int ac, char** av)
   /* so that pages are bound on the current core */
   fill_array(array, count * sizeof(double));
 
-  for_foreach(array, count, 10);
+  for_foreach(array, count, CONFIG_ITER_COUNT);
+  if (check_array(array, count) == -1)
+    printf("INVALID_ARRAY\n");
 
   free_array(array, count * sizeof(double));
 
