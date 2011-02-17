@@ -16,16 +16,13 @@
 /* static configuration
  */
 
-#define CONFIG_USE_IDKOIFF 1
-#define CONFIG_USE_IDFREEZE 0
-
 #define CONFIG_PAGE_SIZE 0x1000
 
 #define CONFIG_PROC_COUNT 128
 
-#define CONFIG_USE_WS_FLAT_GROUP 1
-#define CONFIG_USE_WS_SINGLE_GROUP 0
-#define CONFIG_USE_WS_MEM_GROUP 0
+#define CONFIG_USE_WS_FLAT_GROUPS 0
+#define CONFIG_USE_WS_SINGLE_GROUPS 0
+#define CONFIG_USE_WS_NUMA_GROUPS 1
 
 
 /* atomics
@@ -256,6 +253,13 @@ static inline void kaapi_bitmap_or
   a->bits[1] |= b->bits[1];
 }
 
+static inline void kaapi_bitmap_and
+(kaapi_bitmap_t* a, const kaapi_bitmap_t* b)
+{
+  a->bits[0] &= b->bits[0];
+  a->bits[1] &= b->bits[1];
+}
+
 static size_t kaapi_bitmap_pos
 (const kaapi_bitmap_t* bitmap, size_t i)
 {
@@ -480,7 +484,7 @@ static kaapi_proc_t* kaapi_proc_alloc(kaapi_procid_t id)
   if (posix_memalign((void**)&proc, CONFIG_PAGE_SIZE, sizeof(kaapi_proc_t)))
     return NULL;
 
-#if CONFIG_NUMA_BIND
+#if CONFIG_USE_NUMA
   kaapi_numa_bind(proc, sizeof(kaapi_proc_t), id);
 #endif
 
@@ -578,118 +582,6 @@ static void* kaapi_proc_thread_entry(void* p)
 }
 
 
-/* memory topology interface
- */
-
-#define KAAPI_MEMTOPO_LEVEL_L1 0
-#define KAAPI_MEMTOPO_LEVEL_L2 1
-#define KAAPI_MEMTOPO_LEVEL_L3 2
-#define KAAPI_MEMTOPO_LEVEL_NUMA 3
-#define KAAPI_MEMTOPO_LEVEL_SOCKET 4
-#define KAAPI_MEMTOPO_LEVEL_MACHINE 5
-
-static const size_t mem_size_bylevel[] =
-{
-  /* l1, l2, l3, numa, socket, machine */
-#if CONFIG_USE_IDFREEZE
-#elif CONFIG_USE_IDKOIFF
-#else
-# error "missing CONFIG_USE_HOSTNAME"
-#endif
-};
-
-static const size_t group_count_bylevel[] =
-{
-  /* l1, l2, l3, numa, socket, machine */
-#if CONFIG_USE_IDFREEZE
-  48, 48, 8, 8, 4, 1
-#elif CONFIG_USE_IDKOIFF
-  16, 16, 8, 8, 8, 1
-#else
-# error "missing CONFIG_USE_HOSTNAME"
-#endif
-};
-
-static size_t kaapi_memtopo_count_groups
-(unsigned int level)
-{
-  /* number of groups available at mem level */
-  return group_count_bylevel[level];
-}
-
-__attribute__((unused))
-static size_t kaapi_memtopo_get_size
-(unsigned int level)
-{
-  /* number of bytes available at mem level */
-  return mem_size_bylevel[level];
-}
-
-static int kaapi_memtopo_get_group_members
-(
- kaapi_bitmap_t* members, size_t* count,
- unsigned int level,
- unsigned int group_index
-)
-{
-  /* todo_not_implemented */
-  return -1;
-}
-
-
-/* uniform binding of pages on nodes at level
- */
-
-static int kaapi_memtopo_bind_uniform
-(void* addr, size_t size, unsigned int level)
-{
-#if 0 /* todo_not_implemented */
-
-  kaapi_ws_layer_t* pos = kwl;
-
-  const kaapi_ws_group_t* group;
-  size_t count;
-  size_t size_per_group;
-  size_t size_per_block;
-
-  while (pos->next != NULL)
-  {
-    if (!(pos->next->flags & KAAPI_WS_LAYER_ALLOCABLE))
-      break ;
-    else if (pos->next->mem_size < size)
-      break ;
-
-    pos = pos->next;
-  }
-
-  /* assume a layer found. for now, assume:
-     mem_size = per_group * group_count
-   */
-
-  size_per_group = size / pos->group_count;
-  block_size = size_per_group;
-  if (size_per_group % size)
-    block_size += ;
-
-  group = pos->groups;
-  count = pos->group_count
-  for (; count; ++group, --count)
-  {
-    kaapi_block_t* block;
-    kaapi_allocate_block(&block);
-    bind(block->addr, block->size, group->memid);
-  }
-
-  return 0;
-
- on_failure:
-
-#endif /* todo_not_implemented */
-
-  return -1;
-}
-
-
 /* a workstealing group contains the workstealing
    registers for a given group (request, reply, ids)
    and the synchronization lock.
@@ -762,8 +654,14 @@ static int write_control_steal(kaapi_proc_t* proc, void* group)
   return 0;
 }
 
+static void kaapi_ws_group_print(kaapi_ws_group_t* group);
+
 static inline void kaapi_ws_group_start(kaapi_ws_group_t* group)
 {
+  printf("starting_group{");
+  kaapi_ws_group_print(group);
+  printf(" }\n");
+
   kaapi_ws_group_foreach(group, write_control_steal, group);
 }
 
@@ -783,65 +681,160 @@ static void kaapi_ws_group_print(kaapi_ws_group_t* group)
 }
 
 
-/* build a workstealing group set according
-   to the machine memory topology and a level.
-   return **groups an array of *group_count members
+/* get the concurrency level
  */
 
-static int kaapi_ws_create_mem_groups
-(kaapi_ws_group_t** groups, size_t* group_count, unsigned int level)
+static size_t kaapi_conf_get_cpucount(void)
 {
-  size_t i;
+  static size_t cpu_count = 0;
 
-  *group_count = kaapi_memtopo_count_groups(level);
-  if (*group_count == 0) return -1;
-
-  *groups = malloc((*group_count) * sizeof(kaapi_ws_group_t));
-  if (*groups == NULL) return -1;
-
-  for (i = 0; i < *group_count; ++i)
+  if (cpu_count == 0)
   {
-    kaapi_ws_group_t* const group = &(*groups)[i];
+    const const char* s = getenv("KAAPI_CPUCOUNT");
+    cpu_count = sysconf(_SC_NPROCESSORS_CONF);
+    /* environ overrides physical count */
+    if (s != NULL) cpu_count = atoi(s);
+  }
 
-    kaapi_ws_group_init(group);
+  return cpu_count;
+}
 
-    kaapi_memtopo_get_group_members
-      (&group->members, &group->member_count, level, i);
+
+/* memory topology interface
+ */
+
+#define KAAPI_MEMTOPO_LEVEL_L1 0
+#define KAAPI_MEMTOPO_LEVEL_L2 1
+#define KAAPI_MEMTOPO_LEVEL_L3 2
+#define KAAPI_MEMTOPO_LEVEL_NUMA 3
+#define KAAPI_MEMTOPO_LEVEL_SOCKET 4
+#define KAAPI_MEMTOPO_LEVEL_MACHINE 5
+
+static const size_t mem_size_bylevel[] =
+{
+  /* l1, l2, l3, numa, socket, machine */
+#if CONFIG_USE_IDFREEZE
+#elif CONFIG_USE_IDKOIFF
+#else
+# error "missing CONFIG_USE_HOSTNAME"
+#endif
+};
+
+static const size_t group_count_bylevel[] =
+{
+  /* l1, l2, l3, numa, socket, machine */
+#if CONFIG_USE_IDFREEZE
+  48, 48, 8, 8, 4, 1
+#elif CONFIG_USE_IDKOIFF
+  16, 16, 8, 8, 8, 1
+#else
+# error "missing CONFIG_USE_HOSTNAME"
+#endif
+};
+
+static size_t kaapi_memtopo_count_groups
+(unsigned int level)
+{
+  /* number of groups available at mem level */
+  return group_count_bylevel[level];
+}
+
+__attribute__((unused))
+static size_t kaapi_memtopo_get_size
+(unsigned int level)
+{
+  /* number of bytes available at mem level */
+  return mem_size_bylevel[level];
+}
+
+static int kaapi_memtopo_get_ws_group_members
+(
+ kaapi_ws_group_t* group,
+ unsigned int level,
+ unsigned int group_index
+)
+{
+  switch (level)
+  {
+  case KAAPI_MEMTOPO_LEVEL_NUMA:
+    {
+      static const size_t per_numa = 6;
+      const unsigned int first_procid = group_index * per_numa;
+      size_t i;
+
+      kaapi_bitmap_zero(&group->members);
+      for (i = 0; i < per_numa; ++i)
+	kaapi_bitmap_set(&group->members, first_procid + i);
+
+      group->member_count = per_numa;
+
+      group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
+      group->first_procid = first_procid;
+    }
+    break ; /* KAAPI_MEMTOPO_LEVEL_NUMA */
+
+  default:
+    {
+      kaapi_bitmap_zero(&group->members);
+      group->member_count = 0;
+    }
+    break ; /* default */
   }
 
   return 0;
 }
 
-static void kaapi_ws_destroy_mem_groups
-(kaapi_ws_group_t* groups, size_t group_count)
-{
-  free(groups);
-}
 
-
-/* build a flat group, containing all the available cores
+/* uniform binding of pages on nodes at level
  */
 
-static int kaapi_ws_create_flat_group(kaapi_ws_group_t* group)
+static int kaapi_memtopo_bind_uniform
+(void* addr, size_t size, unsigned int level)
 {
-  const char* const s = getenv("KAAPI_CPUCOUNT");
-  size_t i, cpu_count;
+#if 0 /* todo_not_implemented */
 
-  cpu_count = sysconf(_SC_NPROCESSORS_CONF);
+  kaapi_ws_layer_t* pos = kwl;
 
-  /* environ overrides physical count */
-  if (s != NULL) cpu_count = atoi(s);
+  const kaapi_ws_group_t* group;
+  size_t count;
+  size_t size_per_group;
+  size_t size_per_block;
 
-  /* create a [0, cpu_count[ flat group */
-  kaapi_ws_group_init(group);
-  group->member_count = cpu_count;
-  group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
-  group->first_procid = 0;
+  while (pos->next != NULL)
+  {
+    if (!(pos->next->flags & KAAPI_WS_LAYER_ALLOCABLE))
+      break ;
+    else if (pos->next->mem_size < size)
+      break ;
 
-  for (i = 0; i < cpu_count; ++i)
-    kaapi_bitmap_set(&group->members, i);
+    pos = pos->next;
+  }
+
+  /* assume a layer found. for now, assume:
+     mem_size = per_group * group_count
+   */
+
+  size_per_group = size / pos->group_count;
+  block_size = size_per_group;
+  if (size_per_group % size)
+    block_size += ;
+
+  group = pos->groups;
+  count = pos->group_count
+  for (; count; ++group, --count)
+  {
+    kaapi_block_t* block;
+    kaapi_allocate_block(&block);
+    bind(block->addr, block->size, group->memid);
+  }
 
   return 0;
+
+ on_failure:
+
+#endif /* todo_not_implemented */
+
+  return -1;
 }
 
 
@@ -992,7 +985,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   }
 
   /* termination requested */
-  if (kaapi_atomic_read(&self_proc->control_word) == KAAPI_PROC_CONTROL_TERM)
+  if (kaapi_atomic_read(&self_proc->control_word) != KAAPI_PROC_CONTROL_STEAL)
     goto on_failure;
 
   /* try to lock again */
@@ -1057,6 +1050,7 @@ static int kaapi_ws_group_split
    a thread is created for every group members
    and bound to the associated resource.
  */
+
 static int kaapi_ws_spawn_groups
 (kaapi_ws_group_t* groups, size_t group_count)
 {
@@ -1160,20 +1154,124 @@ static void kaapi_ws_leave_adaptive
 }
 
 
-#if 0 /* todo_not_implemented */
-
 /* workstealing groups construction
  */
 
 static kaapi_ws_group_t* kaapi_single_groups = NULL;
 static size_t kaapi_single_group_count;
 
+static kaapi_ws_group_t* kaapi_flat_groups = NULL;
+static size_t kaapi_flat_group_count;
+
+static kaapi_ws_group_t* kaapi_numa_groups = NULL;
+static size_t kaapi_numa_group_count;
+
 static int create_single_groups(void)
 {
+  /* create cpu_count singletons */
+
+  const size_t cpu_count = kaapi_conf_get_cpucount();
+  kaapi_ws_group_t* const groups =
+    malloc(cpu_count * sizeof(kaapi_ws_group_t));
+  size_t i;
+
+  if (groups == NULL) return -1;
+
+  for (i = 0; i < cpu_count; ++i)
+  {
+    kaapi_ws_group_t* const group = &groups[i];
+
+    kaapi_ws_group_init(group);
+    group->member_count = 1;
+    group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
+    group->first_procid = 0;
+
+    kaapi_bitmap_set(&group->members, i);
+  }
+
+  kaapi_single_groups = groups;
+  kaapi_single_group_count = cpu_count;
+
+  return 0;
+}
+
+static int create_flat_groups(void)
+{
+  /* create a [0, cpu_count[ flat group */
+
+  const size_t cpu_count = kaapi_conf_get_cpucount();
+  kaapi_ws_group_t* const groups = malloc(sizeof(kaapi_ws_group_t));
+  kaapi_ws_group_t* group;
+  size_t i;
+
+  if (groups == NULL) return -1;
+
+  group = &groups[0];
+  kaapi_ws_group_init(group);
+  group->member_count = cpu_count;
+  group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
+  group->first_procid = 0;
+
+  for (i = 0; i < cpu_count; ++i)
+    kaapi_bitmap_set(&group->members, i);
+
+  kaapi_flat_groups = groups;
+  kaapi_flat_group_count = 1;
+
+  return 0;
+}
+
+static int create_numa_groups(void)
+{
+  static const unsigned int mem_level = KAAPI_MEMTOPO_LEVEL_NUMA;
+
+  kaapi_ws_group_t* groups;
+  size_t group_count;
+  size_t i;
+
+  group_count = kaapi_memtopo_count_groups(mem_level);
+
+  groups = malloc(group_count * sizeof(kaapi_ws_group_t));
+  if (groups == NULL) return -1;
+
+  for (i = 0; i < group_count; ++i)
+  {
+    kaapi_ws_group_t* const group = &groups[i];
+    kaapi_ws_group_init(group);
+    kaapi_memtopo_get_ws_group_members(group, mem_level, i);
+  }
+
+  /* todo_clean: build the acutal physical cpu filter and apply */
+  {
+    const size_t cpu_count = kaapi_conf_get_cpucount();
+    kaapi_bitmap_t all_cpus;
+
+    kaapi_bitmap_zero(&all_cpus);
+    for (i = 0; i < cpu_count; ++i)
+      kaapi_bitmap_set(&all_cpus, i);
+
+    for (i = 0; i < group_count; ++i)
+    {
+      kaapi_ws_group_t* const group = &groups[i];
+      kaapi_bitmap_and(&group->members, &all_cpus);
+      group->member_count = kaapi_bitmap_count(&group->members);
+    }
+
+  } /* todo_clean */
+
+  kaapi_numa_groups = groups;
+  kaapi_numa_group_count = group_count;
+
+  return 0;
 }
 
 static int kaapi_create_all_ws_groups(void)
 {
+  create_single_groups();
+  create_flat_groups();
+  create_numa_groups();
+
+  return 0;
 }
 
 static void kaapi_destroy_all_ws_groups(void)
@@ -1183,9 +1281,19 @@ static void kaapi_destroy_all_ws_groups(void)
     free(kaapi_single_groups);
     kaapi_single_groups = NULL;
   }
-}
 
-#endif /* todo_not_implemented */
+  if (kaapi_flat_groups != NULL)
+  {
+    free(kaapi_flat_groups);
+    kaapi_flat_groups = NULL;
+  }
+
+  if (kaapi_numa_groups != NULL)
+  {
+    free(kaapi_numa_groups);
+    kaapi_numa_groups = NULL;
+  }
+}
 
 
 /* kaapi constructor, destructor
@@ -1195,6 +1303,10 @@ static int kaapi_initialize(void)
 {
   if (pthread_key_create(&kaapi_proc_key, NULL)) return -1;
   memset((void*)kaapi_all_procs, 0, sizeof(kaapi_all_procs));
+
+  if (kaapi_create_all_ws_groups() == -1)
+    return -1;
+
   return 0;
 }
 
@@ -1233,6 +1345,8 @@ static void kaapi_finalize(void)
   kaapi_proc_foreach(free_proc_term, NULL);
 
   pthread_key_delete(kaapi_proc_key);
+
+  kaapi_destroy_all_ws_groups();
 }
 
 
@@ -1321,11 +1435,6 @@ static void splitter
   vw->j -= req_count * unit_size;
 
   kaapi_lock_release(&vw->lock);
-
-#if 0 /* todo_remove */
-  if (req_count)
-    printf("req_count: %lu, %lu\n", req_count, req_count * unit_size);
-#endif
 
   for (i = 0; req_count; stolen_j -= unit_size, ++i, --req_count)
   {
@@ -1439,41 +1548,6 @@ static void foreach_master(foreach_work_t* work)
 }
 
 
-static int create_ws_groups
-(kaapi_ws_group_t** groups, size_t* group_count)
-{
-#if CONFIG_USE_WS_FLAT_GROUP
-  *groups = malloc(sizeof(kaapi_ws_group_t));
-  if (*groups == NULL) goto on_error;
-  *group_count = 1;
-  if (kaapi_ws_create_flat_group(&(*groups)[0]))
-    goto on_error;
-#elif CONFIG_USE_WS_MEM_GROUP
-  if (kaapi_ws_create_flat_group(&groups[0], &group_count))
-    goto on_error;
-#endif
-
-  return 0;
-
- on_error:
-  if (*groups != NULL) free(*groups);
-  return -1;
-}
-
-static void destroy_ws_groups
-(kaapi_ws_group_t* groups, size_t group_count)
-{
-  if (groups != NULL)
-  {
-#if CONFIG_USE_WS_FLAT_GROUP
-    free(groups);
-#elif CONFIG_USE_WS_MEM_GROUP
-    kaapi_ws_destroy_mem_groups(groups, group_count);
-#endif
-  }
-}
-
-
 static int for_foreach
 (double* array, size_t size, size_t iter_count)
 {
@@ -1496,9 +1570,19 @@ static int for_foreach
   /* bind memory uniformly amongst memory levels */
   kaapi_memtopo_bind_uniform(array, total_size, mem_level);
 
-  /* create the groups */
-  if (create_ws_groups(&groups, &group_count))
-    goto on_error;
+  /* select the groups to used */
+#if CONFIG_USE_WS_FLAT_GROUPS
+  groups = kaapi_flat_groups;
+  group_count = kaapi_flat_group_count;
+#elif CONFIG_USE_WS_SINGLE_GROUPS
+  groups = kaapi_single_groups;
+  group_count = kaapi_single_group_count;
+#elif CONFIG_USE_WS_NUMA_GROUPS
+  groups = kaapi_numa_groups;
+  group_count = kaapi_numa_group_count;
+#else
+# error "CONFIG_USE_WS_XXX_GROUPS undefined"
+#endif
 
   /* spawn the associated threads */
   if (kaapi_ws_spawn_groups(groups, group_count))
@@ -1506,7 +1590,10 @@ static int for_foreach
 
   /* make them steal */
   for (i = 0; i < group_count; ++i)
+  {
+    /* todo: kaapi_ws_group_bind(&groups[i]); */
     kaapi_ws_group_start(&groups[i]);
+  }
 
   /* initialize the work */
   init_foreach_work(&work, array, size);
@@ -1535,7 +1622,6 @@ static int for_foreach
   error = 0;
 
  on_error:
-  destroy_ws_groups(groups, group_count);
   return error;
 }
 

@@ -103,13 +103,19 @@ a level <= the current one.
    -> kaapi_memtopo_create_group_for_data();
 
  . C++ interface
-  . ka::group simple_group(1, 2, 4);
-  . ka::sched::enter_adaptive_section(splitter, args, simple_group);
+  . ka::ws::bind_groups(ka::ws::l3_groups);
+  . ka::sched::enter_adaptive_section(splitter, args);
   . ka::sched::leave_adaptive_section();
 
 
  . todo
-  . initial splitting
+  . group subscribing
+   . subscribed_members
+   . allowed_members
+   -> needed for dynamic membering
+   . bind_ws_group(&kaapi_context, groups, count);
+   // bind some thread from the pool to groups
+
 
   . the request must be set by group, not by kproc. todo
 
