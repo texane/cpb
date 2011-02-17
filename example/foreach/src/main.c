@@ -929,9 +929,19 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
  redo_select:
   victim_id = kaapi_ws_groupid_to_procid(group, select_group_victim(group));
   if (victim_id == self_proc->id_word)
+  {
+    /* if we are alone in the group, redoing the
+       select would result in an infinite loop
+     */
+    if (group->member_count == 1) goto on_failure;
     goto redo_select;
+  }
 
   kaapi_ws_request_post(self_req, victim_id);
+
+#if 0
+  printf("req: %lu -> %lu\n", self_proc->id_word, victim_id);
+#endif
 
  redo_acquire:
   if (kaapi_lock_try_acquire(&group->lock))
@@ -1184,7 +1194,7 @@ static int create_single_groups(void)
     kaapi_ws_group_init(group);
     group->member_count = 1;
     group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
-    group->first_procid = 0;
+    group->first_procid = i;
 
     kaapi_bitmap_set(&group->members, i);
   }
