@@ -9,21 +9,16 @@
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 
 
-/* static configuration
+/* static runtime configuration
  */
 
 #define CONFIG_PAGE_SIZE 0x1000
-
 #define CONFIG_PROC_COUNT 128
-
-#define CONFIG_USE_WS_FLAT_GROUPS 0
-#define CONFIG_USE_WS_SINGLE_GROUPS 0
-#define CONFIG_USE_WS_NUMA_GROUPS 0
-#define CONFIG_USE_WS_AMUN_GROUPS 1
 
 
 /* atomics
@@ -304,6 +299,7 @@ static inline unsigned long kaapi_xxx_map_procid(kaapi_procid_t id)
 #if CONFIG_USE_NUMA
 
 #include <numaif.h>
+#include <numa.h>
 
 /* numa routines
  */
@@ -659,9 +655,11 @@ static void kaapi_ws_group_print(kaapi_ws_group_t* group);
 
 static inline void kaapi_ws_group_start(kaapi_ws_group_t* group)
 {
+#if 1
   printf("starting_group{");
   kaapi_ws_group_print(group);
   printf(" }\n");
+#endif
 
   kaapi_ws_group_foreach(group, write_control_steal, group);
 }
@@ -737,7 +735,23 @@ static size_t kaapi_memtopo_count_groups
 (unsigned int level)
 {
   /* number of groups available at mem level */
-  return group_count_bylevel[level];
+
+  size_t group_count;
+
+  switch (level)
+  {
+  case KAAPI_MEMTOPO_LEVEL_NUMA:
+    {
+      group_count = (size_t)numa_max_node() + 1;
+    } break ;
+
+  default:
+    {
+      group_count = group_count_bylevel[level];
+    } break ;
+  }
+
+  return group_count;
 }
 
 __attribute__((unused))
@@ -759,18 +773,25 @@ static int kaapi_memtopo_get_ws_group_members
   {
   case KAAPI_MEMTOPO_LEVEL_NUMA:
     {
-      static const size_t per_numa = 6;
-      const unsigned int first_procid = group_index * per_numa;
-      size_t i;
+      struct bitmask* cpu_mask;
+      size_t cpu_pos;
 
       kaapi_bitmap_zero(&group->members);
-      for (i = 0; i < per_numa; ++i)
-	kaapi_bitmap_set(&group->members, first_procid + i);
 
-      group->member_count = per_numa;
+      cpu_mask = numa_allocate_cpumask();
+      if (cpu_mask == NULL) break ;
 
-      group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
-      group->first_procid = first_procid;
+      if (numa_node_to_cpus(group_index, cpu_mask) != -1)
+      {
+	for (cpu_pos = 0; cpu_pos < CONFIG_PROC_COUNT; ++cpu_pos)
+	  if (numa_bitmask_isbitset(cpu_mask, (unsigned int)cpu_pos))
+	  {
+	    kaapi_bitmap_set(&group->members, cpu_pos);
+	    ++group->member_count;
+	  }
+      }
+
+      numa_free_cpumask(cpu_mask);
     }
     break ; /* KAAPI_MEMTOPO_LEVEL_NUMA */
 
@@ -1318,6 +1339,7 @@ static int create_amun_groups(void)
     kaapi_ws_group_t tmp_group;
     kaapi_procid_t first_procid;
 
+    kaapi_ws_group_init(&tmp_group);
     kaapi_memtopo_get_ws_group_members(&tmp_group, mem_level, i);
     if (tmp_group.member_count == 0) continue ;
     first_procid = kaapi_bitmap_scan(&tmp_group.members, 0);
@@ -1439,6 +1461,12 @@ static void kaapi_finalize(void)
 /* foreach algorithm, application dependant.
  */
 
+#define CONFIG_USE_WS_FLAT_GROUPS 0
+#define CONFIG_USE_WS_SINGLE_GROUPS 0
+#define CONFIG_USE_WS_NUMA_GROUPS 1
+#define CONFIG_USE_WS_AMUN_GROUPS 0
+
+
 typedef struct term_hack
 {
   /* hack to detect the algorithm end */
@@ -1448,10 +1476,10 @@ typedef struct term_hack
 
 typedef struct foreach_work
 {
+  kaapi_lock_t lock;
+
   /* termination_hack */
   term_hack_t* term_hack;
-
-  kaapi_lock_t lock;
 
   double* array;
   volatile size_t i;
@@ -1496,7 +1524,7 @@ static void splitter
 
   kaapi_lock_acquire(&vw->lock);
 
-#define CONFIG_PAR_GRAIN 32
+#define CONFIG_PAR_GRAIN 64
 
   work_size = vw->j - vw->i;
 
@@ -1572,7 +1600,7 @@ static int extract_seq
 
 static void foreach_common(foreach_work_t* w)
 {
-  static const size_t seq_size = 128;
+  static const size_t seq_size = 256;
 
   /* termination_hack */
   size_t term_size = 0;
@@ -1618,19 +1646,9 @@ static void foreach_master(foreach_work_t* work)
   kaapi_ws_leave_adaptive(self_proc);
 
   /* termination_hack */
-#if 0
-  printf(">> TERM_HACK: %lu / %lu\n",
-	 kaapi_atomic_read(&work->term_hack->counter),
-	 work->term_hack->size);
-#endif
-
   while (kaapi_atomic_read(&work->term_hack->counter) != work->term_hack->size)
     kaapi_cpu_slowdown();
   kaapi_atomic_write(&work->term_hack->counter, 0);
-
-#if 0
-  printf("<< TERM_HACK\n");
-#endif
 }
 
 
@@ -1656,7 +1674,7 @@ static int for_foreach
   /* bind memory uniformly amongst memory levels */
   kaapi_memtopo_bind_uniform(array, total_size, mem_level);
 
-  /* select the groups to used */
+  /* select the groups to use */
 #if CONFIG_USE_WS_FLAT_GROUPS
   groups = kaapi_flat_groups;
   group_count = kaapi_flat_group_count;
@@ -1695,6 +1713,10 @@ static int for_foreach
   /* run algorithm */
   for (i = 0; i < iter_count; ++i)
   {
+    struct timeval beg, end, diff;
+
+    gettimeofday(&beg, NULL);
+
     set_foreach_work(&work, array, size);
 
     if (i == 0)
@@ -1703,8 +1725,11 @@ static int for_foreach
       kaapi_ws_group_split(groups, group_count, splitter, &work);
     }
 
-    printf("----\n");
     foreach_master(&work);
+
+    gettimeofday(&end, NULL);
+    timersub(&end, &beg, &diff);
+    printf("%lf ms.\n", ((double)diff.tv_sec * 1E6 + diff.tv_usec) / 1000.);
   }
 
   /* success */
@@ -1761,8 +1786,7 @@ static int check_array(const double* addr, size_t count)
 
 int main(int ac, char** av)
 {
-/* #define CONFIG_ARRAY_COUNT (1 * 1024 * 1024) */
-#define CONFIG_ARRAY_COUNT (4096 * 10)
+#define CONFIG_ARRAY_COUNT (10 * 1024 * 1024)
   double* array = NULL;
   size_t count = CONFIG_ARRAY_COUNT;
 
@@ -1774,12 +1798,12 @@ int main(int ac, char** av)
   fill_array(array, count * sizeof(double));
 
   for_foreach(array, count, CONFIG_ITER_COUNT);
+
   if (check_array(array, count) == -1)
     printf("INVALID_ARRAY\n");
 
   free_array(array, count * sizeof(double));
 
-  printf("KAAPI_FINALIZE\n");
   kaapi_finalize();
 
   return 0;

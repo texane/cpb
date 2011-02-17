@@ -116,6 +116,9 @@ a level <= the current one.
    . bind_ws_group(&kaapi_context, groups, count);
    // bind some thread from the pool to groups
 
+  . optimization
+   . review data false sharing (group lock, work lock)
+   . structures should be allocated where appropriate in mem
 
   . the request must be set by group, not by kproc. todo
 
