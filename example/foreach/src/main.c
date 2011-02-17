@@ -151,6 +151,11 @@ static inline void kaapi_mem_read_barrier(void)
   __sync_synchronize();
 }
 
+static inline void kaapi_mem_full_barrier(void)
+{
+  __sync_synchronize();
+}
+
 
 /* locks
  */
@@ -387,7 +392,7 @@ static inline unsigned int kaapi_ws_request_test_ack
   const unsigned long ored_value =
     KAAPI_WS_REQUEST_REPLIED | KAAPI_WS_REQUEST_POSTED;
 
-  unsigned int is_replied = __sync_bool_compare_and_swap
+  const unsigned int is_replied = __sync_bool_compare_and_swap
     (&req->status.value, ored_value, KAAPI_WS_REQUEST_UNDEF);
 
   return is_replied;
@@ -427,7 +432,7 @@ typedef struct kaapi_proc
 
   /* current adaptive task */
   kaapi_refn_t ws_split_refn;
-  volatile kaapi_ws_splitfn_t ws_split_fn;
+  kaapi_ws_splitfn_t volatile ws_split_fn;
   void* volatile ws_split_data;
 
   /* workstealing */
@@ -886,27 +891,37 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   {
     kaapi_proc_t* const victim_proc = kaapi_proc_byid(victim_id);
 
-    if (kaapi_refn_get(&victim_proc->ws_split_refn) != -1)
+    /* use a local split_fn to allow leave_adaptive to set NULL.
+       otherwise, a refn_get always succeeds and leave_adaptive
+       would starve
+    */
+    kaapi_ws_splitfn_t const split_fn = victim_proc->ws_split_fn;
+
+    if (split_fn != NULL)
     {
-      /* todo_optimize: store post / reply as bits. knowing
-	 who posted in the group is just a matter or oring
-       */
+      if (kaapi_refn_get(&victim_proc->ws_split_refn) != -1)
+      {
+	/* todo_optimize: store post / reply as bits. knowing
+	   who posted in the group is just a matter or oring
+	*/
 
-      kaapi_bitmap_t reqs;
-      size_t req_count;
+	kaapi_bitmap_t reqs;
+	size_t req_count;
 
-      kaapi_bitmap_zero(&reqs);
-      kaapi_ws_group_foreach(group, set_member_req, &reqs);
-      req_count = kaapi_bitmap_count(&reqs);
-      victim_proc->ws_split_fn
-	(&reqs, req_count, victim_proc->ws_split_data);
-    }
+	kaapi_bitmap_zero(&reqs);
+	kaapi_ws_group_foreach(group, set_member_req, &reqs);
+	req_count = kaapi_bitmap_count(&reqs);
+	split_fn(&reqs, req_count, victim_proc->ws_split_data);
 
-    kaapi_refn_put(&victim_proc->ws_split_refn);
+      } /* split_fn != NULL */
+
+      kaapi_refn_put(&victim_proc->ws_split_refn);
+
+    } /* refn_acquired */
 
     kaapi_lock_release(&group->lock);
 
-  } /* try_acquire */
+  } /* lock_acquired */
 
   /* test our own request */
   if (kaapi_ws_request_test_ack(&self_proc->ws_request))
@@ -1078,25 +1093,39 @@ static void kaapi_ws_enter_adaptive
 static void kaapi_ws_leave_adaptive
 (kaapi_proc_t* proc)
 {
+  /* avoid starvation */
+  proc->ws_split_fn = NULL;
   kaapi_refn_put(&proc->ws_split_refn);
   kaapi_refn_wait(&proc->ws_split_refn);
 }
 
 
-/* internal groups construction
+#if 0 /* todo_not_implemented */
+
+/* workstealing groups construction
  */
 
 static kaapi_ws_group_t* kaapi_single_groups = NULL;
 static size_t kaapi_single_group_count;
 
-/* todo */
-static kaapi_ws_group_t* kaapi_xx ... 
+static int create_single_groups(void)
+{
+}
 
 static int kaapi_create_all_ws_groups(void)
-{}
+{
+}
 
 static void kaapi_destroy_all_ws_groups(void)
-{}
+{
+  if (kaapi_single_groups != NULL)
+  {
+    free(kaapi_single_groups);
+    kaapi_single_groups = NULL;
+  }
+}
+
+#endif /* todo_not_implemented */
 
 
 /* kaapi constructor, destructor
