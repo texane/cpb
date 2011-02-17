@@ -109,6 +109,8 @@ a level <= the current one.
 
 
  . todo
+  . initial splitting
+
   . the request must be set by group, not by kproc. todo
 
   . grouping

@@ -369,6 +369,13 @@ static inline unsigned int kaapi_ws_request_is_posted
   return kaapi_atomic_read(&req->status) & KAAPI_WS_REQUEST_POSTED;
 }
 
+static inline unsigned int kaapi_ws_request_is_replied
+(kaapi_ws_request_t* req)
+{
+  /* return a boolean value */
+  return kaapi_atomic_read(&req->status) & KAAPI_WS_REQUEST_REPLIED;
+}
+
 static void kaapi_ws_request_post
 (kaapi_ws_request_t* req, kaapi_procid_t victim_id)
 {
@@ -874,6 +881,10 @@ typedef struct kaapi_ws_layer
 
 static int set_member_req(kaapi_proc_t* proc, void* reqs)
 {
+  /* dont overwrite already replied requests */
+  if (kaapi_ws_request_is_replied(&proc->ws_request))
+    return 0;
+
   if (kaapi_ws_request_is_posted(&proc->ws_request))
     kaapi_bitmap_set(reqs, proc->id_word);
 
@@ -1311,9 +1322,10 @@ static void splitter
 
   kaapi_lock_release(&vw->lock);
 
+#if 0 /* todo_remove */
   if (req_count)
-    printf("req_count: %lu, %lu\n",
-	   req_count, req_count * unit_size);
+    printf("req_count: %lu, %lu\n", req_count, req_count * unit_size);
+#endif
 
   for (i = 0; req_count; stolen_j -= unit_size, ++i, --req_count)
   {
@@ -1382,6 +1394,10 @@ static void foreach_common(foreach_work_t* w)
   }
 
   /* termination_hack */
+#if 0
+  printf("[%lu] term_hac += %lu / %lu\n",
+	 kaapi_proc_get_self()->id_word, term_size, w->term_hack->size);
+#endif
   kaapi_atomic_add(&w->term_hack->counter, term_size);
 }
 
@@ -1407,16 +1423,19 @@ static void foreach_master(foreach_work_t* work)
   kaapi_ws_leave_adaptive(self_proc);
 
   /* termination_hack */
-
+#if 0
   printf(">> TERM_HACK: %lu / %lu\n",
 	 kaapi_atomic_read(&work->term_hack->counter),
 	 work->term_hack->size);
+#endif
 
   while (kaapi_atomic_read(&work->term_hack->counter) != work->term_hack->size)
     kaapi_cpu_slowdown();
   kaapi_atomic_write(&work->term_hack->counter, 0);
 
+#if 0
   printf("<< TERM_HACK\n");
+#endif
 }
 
 
@@ -1502,13 +1521,11 @@ static int for_foreach
   {
     set_foreach_work(&work, array, size);
 
-#if 0 /* todo_uncomment */
     if (i == 0)
     {
       /* initial split amongst the groups */
       kaapi_ws_group_split(groups, group_count, splitter, &work);
     }
-#endif /* todo_uncomment */
 
     printf("----\n");
     foreach_master(&work);
