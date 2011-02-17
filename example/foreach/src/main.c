@@ -22,7 +22,8 @@
 
 #define CONFIG_USE_WS_FLAT_GROUPS 0
 #define CONFIG_USE_WS_SINGLE_GROUPS 0
-#define CONFIG_USE_WS_NUMA_GROUPS 1
+#define CONFIG_USE_WS_NUMA_GROUPS 0
+#define CONFIG_USE_WS_AMUN_GROUPS 1
 
 
 /* atomics
@@ -925,18 +926,31 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 
   kaapi_procid_t victim_id;
 
-  /* emit the stealing request */
+  /* select a victim and particular cases */
  redo_select:
   victim_id = kaapi_ws_groupid_to_procid(group, select_group_victim(group));
   if (victim_id == self_proc->id_word)
   {
+    /* initial split mechanism may have posted
+       a reply before we post the request.
+    */
+    if (kaapi_ws_request_is_replied(self_req))
+    {
+      /* todo_optim: avoid posting the request */
+      kaapi_ws_request_post(self_req, victim_id);
+      goto on_reply;
+    }
+
     /* if we are alone in the group, redoing the
-       select would result in an infinite loop
+       select would result in an infinite loop.
      */
     if (group->member_count == 1) goto on_failure;
+
+    /* retry victim selection */
     goto redo_select;
   }
 
+  /* emit the request */
   kaapi_ws_request_post(self_req, victim_id);
 
 #if 0
@@ -985,6 +999,7 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
   } /* lock_acquired */
 
   /* test our own request */
+ on_reply:
   if (kaapi_ws_request_test_ack(&self_proc->ws_request))
   {
     if (self_req->exec_fn == NULL) goto on_failure;
@@ -1011,18 +1026,19 @@ static int kaapi_ws_steal_work(kaapi_ws_work_t* work)
 
 /* force a split of the data amongst all group members
  */
+
 static int kaapi_ws_group_split
 (
  kaapi_ws_group_t* groups, size_t group_count,
  kaapi_ws_splitfn_t split_fn, void* split_data
 )
 {
-  /* this function must not be called concurrently with
-     another splitter since there is 2 concurrency issues:
+  /* cannot be called inside an adaptive section.
+     2 splitter related concurrency issues:
      . a coarse one: the request data would be overwrite
      . a finer one: a group member request may have been
-     replied but has not yet seen. to avoid this, we can
-     try a compare_and_swap race winning scheme.
+     replied but has not yet seen. avoiding this, would
+     be done by try a compare_and_swap race winning scheme.
   */
 
   kaapi_bitmap_t reqs;
@@ -1176,6 +1192,9 @@ static size_t kaapi_flat_group_count;
 static kaapi_ws_group_t* kaapi_numa_groups = NULL;
 static size_t kaapi_numa_group_count;
 
+static kaapi_ws_group_t* kaapi_amun_groups = NULL;
+static size_t kaapi_amun_group_count;
+
 static int create_single_groups(void)
 {
   /* create cpu_count singletons */
@@ -1275,11 +1294,59 @@ static int create_numa_groups(void)
   return 0;
 }
 
+static int create_amun_groups(void)
+{
+  /* for testing purposes only
+     can use less than cpu_count
+   */
+
+  static const unsigned int mem_level = KAAPI_MEMTOPO_LEVEL_NUMA;
+
+  const size_t cpu_count = kaapi_conf_get_cpucount();
+
+  kaapi_ws_group_t* groups;
+  size_t group_count;
+  size_t i;
+
+  group_count = kaapi_memtopo_count_groups(mem_level);
+  groups = malloc(group_count * sizeof(kaapi_ws_group_t));
+  if (groups == NULL) return -1;
+
+  for (i = 0; i < group_count; ++i)
+  {
+    kaapi_ws_group_t* const group = &groups[i];
+    kaapi_ws_group_t tmp_group;
+    kaapi_procid_t first_procid;
+
+    kaapi_memtopo_get_ws_group_members(&tmp_group, mem_level, i);
+    if (tmp_group.member_count == 0) continue ;
+    first_procid = kaapi_bitmap_scan(&tmp_group.members, 0);
+
+    /* make the group */
+    kaapi_ws_group_init(group);
+
+    /* currently, [0, cpu_count[ cpus available */
+    if (first_procid >= cpu_count) continue ;
+
+    kaapi_bitmap_zero(&group->members);
+    group->flags |= KAAPI_WS_GROUP_CONTIGUOUS;
+    group->first_procid = first_procid;
+    kaapi_bitmap_set(&group->members, first_procid);
+    group->member_count = 1;
+  }
+
+  kaapi_amun_groups = groups;
+  kaapi_amun_group_count = group_count;
+
+  return 0;
+}
+
 static int kaapi_create_all_ws_groups(void)
 {
   create_single_groups();
   create_flat_groups();
   create_numa_groups();
+  create_amun_groups();
 
   return 0;
 }
@@ -1303,6 +1370,12 @@ static void kaapi_destroy_all_ws_groups(void)
     free(kaapi_numa_groups);
     kaapi_numa_groups = NULL;
   }
+
+  if (kaapi_amun_groups != NULL)
+  {
+    free(kaapi_amun_groups);
+    kaapi_amun_groups = NULL;
+  }
 }
 
 
@@ -1311,7 +1384,10 @@ static void kaapi_destroy_all_ws_groups(void)
 
 static int kaapi_initialize(void)
 {
+  srand(getpid() * time(0));
+
   if (pthread_key_create(&kaapi_proc_key, NULL)) return -1;
+
   memset((void*)kaapi_all_procs, 0, sizeof(kaapi_all_procs));
 
   if (kaapi_create_all_ws_groups() == -1)
@@ -1590,6 +1666,9 @@ static int for_foreach
 #elif CONFIG_USE_WS_NUMA_GROUPS
   groups = kaapi_numa_groups;
   group_count = kaapi_numa_group_count;
+#elif CONFIG_USE_WS_AMUN_GROUPS
+  groups = kaapi_amun_groups;
+  group_count = kaapi_amun_group_count;
 #else
 # error "CONFIG_USE_WS_XXX_GROUPS undefined"
 #endif
