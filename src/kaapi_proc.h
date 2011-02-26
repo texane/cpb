@@ -85,6 +85,10 @@ static inline kaapi_proc_t* kaapi_proc_get_self(void)
 static inline kaapi_procid_t kaapi_proc_self_id(void)
 { return kaapi_proc_get_self()->id_word; }
 
+static inline kaapi_procid_t kaapi_proc_get_id
+(const kaapi_proc_t*  proc)
+{ return proc->id_word; }
+
 static inline kaapi_proc_t* kaapi_proc_get_byid(kaapi_procid_t id)
 { return kaapi_all_procs[id]; }
 

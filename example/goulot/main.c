@@ -61,6 +61,17 @@ static void invalidate_memory
   for (; count; --count, ++p) *p = value;
 }
 
+static int print_proc_counters(kaapi_proc_t* proc, void* fubar)
+{
+  kaapi_perf_counter_t counters[KAAPI_PERF_MAX_COUNTERS] = { 0 };
+
+  if (proc == kaapi_proc_get_self()) return 0;
+
+  kaapi_perf_accum_proc_counters(proc, counters);
+  printf("%02lu: %llu\n", kaapi_proc_get_id(proc), counters[0]);
+  return 0;
+}
+
 int main(int ac, char** av)
 {
   /* every command line provided ids are
@@ -168,9 +179,11 @@ int main(int ac, char** av)
 
   printf("perthreadTime: %lf ms. memRate: %lf MB/s.\n", perthread_msecs, rate);
 
+  kaapi_proc_foreach(print_proc_counters, kaapi_proc_get_self());
+
   kaapi_perf_counter_t counters[KAAPI_PERF_MAX_COUNTERS] = { 0 };
   kaapi_perf_accum_all_counters(counters);
-  printf("%llu\n", counters[0]);
+  printf("to: %llu\n", counters[0]);
 
   kaapi_mt_join_threads(&cpu_map);
 
