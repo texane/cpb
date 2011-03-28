@@ -40,7 +40,25 @@ static void task_entry(void* args)
   kaapi_perf_start_counters();
 
   gettimeofday(&sta, NULL);
+
+#if 0
+  static const size_t buffer_size = 0x1000;
+  for (i = 0; i < size; i += buffer_size)
+  {
+    uint64_t local_buffer[buffer_size];
+    const size_t local_size =
+      buffer_size > (size - i) ? (size - i) : buffer_size;
+
+    memcpy
+      (local_buffer, (void*)p, local_size * sizeof(uint64_t));
+
+    size_t j;
+    for (j = 0; j < local_size; ++j, ++p) sum += *p;
+  }
+#else
   for (i = 0; i < size; ++i, ++p) sum += *p;
+#endif
+
   gettimeofday(&now, NULL);
 
   kaapi_perf_stop_counters();
@@ -61,14 +79,19 @@ static void invalidate_memory
   for (; count; --count, ++p) *p = value;
 }
 
+__attribute__((unused))
 static int print_proc_counters(kaapi_proc_t* proc, void* fubar)
 {
-  kaapi_perf_counter_t counters[KAAPI_PERF_MAX_COUNTERS] = { 0 };
+  kaapi_perf_counter_t counters[KAAPI_PERF_MAX_COUNTERS] = { 0, 0, 0 };
 
-  if (proc == kaapi_proc_get_self()) return 0;
+  /* if (proc == kaapi_proc_get_self()) return 0; */
 
   kaapi_perf_accum_proc_counters(proc, counters);
-  printf("%02lu: %llu\n", kaapi_proc_get_id(proc), counters[0]);
+
+  printf("%02lu: %llu %llu\n",
+	 kaapi_proc_get_id(proc),
+	 counters[0], counters[1]);
+
   return 0;
 }
 
@@ -88,6 +111,8 @@ int main(int ac, char** av)
   const kaapi_procid_t source_id = atoi(av[1]);
   const kaapi_procid_t master_id = atoi(av[2]);
 
+  struct timeval sto, sta, dif;
+
   void* addr;
   size_t total_size;
   size_t perthread_size;
@@ -97,6 +122,7 @@ int main(int ac, char** av)
   size_t i;
   size_t iter;
 
+  uint64_t master_usecs;
   uint64_t total_usecs;
   uint64_t total_sum;
 
@@ -133,6 +159,7 @@ int main(int ac, char** av)
 
   kaapi_mt_create_threads(&cpu_map);
 
+  master_usecs = 0;
   for (iter = 0; iter < CONFIG_ITER_COUNT; ++iter)
   {
     kaapi_procid_t id;
@@ -149,7 +176,18 @@ int main(int ac, char** av)
     }
 
     pthread_barrier_wait(&start_barrier);
+
+    /* start perf */
+    kaapi_perf_start_counters();
+    gettimeofday(&sta, NULL);
+
     pthread_barrier_wait(&stop_barrier);
+
+    /* stop perf */
+    kaapi_perf_stop_counters();
+    gettimeofday(&sto, NULL);
+    timersub(&sto, &sta, &dif);
+    master_usecs += dif.tv_sec * 1000000 + dif.tv_usec;
   }
 
   /* reduce results */
@@ -170,6 +208,7 @@ int main(int ac, char** av)
     printf("invalid sum: %lu != %lu\n", wanted_sum, total_sum);
 #endif
 
+#if 0
   const double total_secs = (double)total_usecs / 1E6;
   const double total_mb = (double)total_size / (1024. * 1024.);
   const double rate = ((double)CONFIG_ITER_COUNT * total_mb) / (total_secs / cpu_count);
@@ -178,12 +217,19 @@ int main(int ac, char** av)
   const double perthread_msecs = total_msecs / (double)cpu_count;
 
   printf("perthreadTime: %lf ms. memRate: %lf MB/s.\n", perthread_msecs, rate);
+#endif
 
-  kaapi_proc_foreach(print_proc_counters, kaapi_proc_get_self());
+  /* kaapi_proc_foreach(print_proc_counters, NULL); */
 
-  kaapi_perf_counter_t counters[KAAPI_PERF_MAX_COUNTERS] = { 0 };
-  kaapi_perf_accum_all_counters(counters);
-  printf("to: %llu\n", counters[0]);
+  kaapi_perf_counter_t self_counters[KAAPI_PERF_MAX_COUNTERS] = { 0, 0, 0 };
+  kaapi_perf_accum_proc_counters(kaapi_proc_get_self(), self_counters);
+  printf("# MasterUsecs      : %lu\n", master_usecs);
+
+  kaapi_perf_counter_t all_counters[KAAPI_PERF_MAX_COUNTERS] = { 0, 0, 0 };
+  kaapi_perf_accum_all_counters(all_counters);
+
+  printf("# totalReadRequests: %llu\n", all_counters[1] - self_counters[1]);
+  printf("# totalCylesStalled: %llu\n", all_counters[2] - self_counters[2]);
 
   kaapi_mt_join_threads(&cpu_map);
 

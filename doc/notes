@@ -1,3 +1,7 @@
+-- todo
+ . papi counters dont work anymore
+ . papi native counters
+
 --- directory organization
 
 . sched
@@ -143,11 +147,3 @@ a level <= the current one.
     . groups[4]
     . if (lock_acquire() && starving_group())
        hierarhical_stealing(current_group = ws_groups[i++])
-
-
----
-. bugs
- . au kaapi_finalize, structures are used concurrently while being freed
-  -> 2 time finalize
-   . ensure everyone saw the term signal
-   . then ask everyone to free

@@ -90,15 +90,20 @@ int kaapi_perf_perthread_initialize(kaapi_proc_t* proc)
   opt.granularity.def_cidx = proc->papi_event_set;
   opt.granularity.eventset = proc->papi_event_set;
   opt.granularity.granularity = PAPI_GRN_THR;
-  if (PAPI_set_opt(PAPI_GRANUL, &opt) != PAPI_OK)
-    return -1;
+  err = PAPI_set_opt(PAPI_GRANUL, &opt);
+  if (err != PAPI_OK) return -1;
 
   /* user domain */
   memset(&opt, 0, sizeof(opt));
   opt.domain.eventset = proc->papi_event_set;
   opt.domain.domain = PAPI_DOM_USER;
-  if (PAPI_set_opt(PAPI_DOMAIN, &opt) != PAPI_OK)
+  err = PAPI_set_opt(PAPI_DOMAIN, &opt);
+  if (err != PAPI_OK)
+  {
+    printf("error == %d\n", err);
+    /* exit(-1); */
     return -1;
+  }
 
   err = PAPI_add_events
     (proc->papi_event_set, papi_event_codes, papi_event_count);
