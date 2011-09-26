@@ -26,6 +26,156 @@ typedef struct task_context
 
 } task_context_t;
 
+
+/* for prefetching, 128 bit accesses  */
+#include <xmmintrin.h>
+
+#if CONFIG_USE_MEMCPY128
+
+static void memcpy128(void* d, const void* s, size_t n)
+{
+  /* d assumed aligned */
+
+  static uintptr_t const mask = 16UL - 1UL;
+
+  /* this is not correct but ok for testing */
+  s = (const void*)((uintptr_t)s & ~mask);
+
+  __m128i* dd = (__m128i*)d;
+  const __m128i* ss = (const __m128i*)s;
+  size_t nn = n / 16;
+
+  /* dd[i] = ss[i]; */
+  for (; nn; --nn, ++dd, ++ss)
+    _mm_store_si128(dd, _mm_load_si128(ss));
+
+  /* finalize */
+  memcpy((void*)dd, (const void*)ss, n & mask);
+}
+
+#define xxx_memcpy memcpy128
+
+#else
+
+#define xxx_memcpy memcpy
+
+#endif /* CONFIG_USE_MEMCPY128 */
+
+
+static inline uint64_t fu(uint64_t bar)
+{
+  /* the following operation gives speedups up to
+     6 cores on the same numa node.
+     theoritically, we could achieve optimzal speedup.
+     Otherwise, suspect some bottleneck on memory controller
+   */
+
+#if (CONFIG_COST > 0)
+  __asm__ __volatile__
+  (
+
+   "incl %0\n\t"
+#if (CONFIG_COST > 1)
+   "incl %0\n\t"
+#endif
+#if (CONFIG_COST > 2)
+   "incl %0\n\t"
+#endif
+#if (CONFIG_COST > 3)
+   "incl %0\n\t"
+#endif
+#if (CONFIG_COST > 4)
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 5)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 10)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 15)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 20)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 25)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 30)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 35)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 40)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 45)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+#if (CONFIG_COST > 50)
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+   "incl %0\n\t"
+#endif
+
+   :"=m"(bar)
+  );
+#endif /* CONFIG_COST > 0 */
+
+  return bar;
+}
+
+
 static void task_entry(void* args)
 {
   volatile task_context_t* const tc = args;
@@ -41,22 +191,63 @@ static void task_entry(void* args)
 
   gettimeofday(&sta, NULL);
 
-#if 0
-  static const size_t buffer_size = 0x1000;
+#if 0 /* use local buffer */
+
+  static const size_t buffer_size = 4 * 0x1000;
   for (i = 0; i < size; i += buffer_size)
   {
-    uint64_t local_buffer[buffer_size];
+    uint64_t local_buffer[buffer_size] __attribute__((aligned(16)));
     const size_t local_size =
       buffer_size > (size - i) ? (size - i) : buffer_size;
 
-    memcpy
-      (local_buffer, (void*)p, local_size * sizeof(uint64_t));
+    xxx_memcpy(local_buffer, (void*)p, local_size * sizeof(uint64_t));
 
     size_t j;
-    for (j = 0; j < local_size; ++j, ++p) sum += *p;
+    for (j = 0; j < local_size; ++j, ++)
+      sum += fu(*p);
   }
-#else
-  for (i = 0; i < size; ++i, ++p) sum += *p;
+
+#elif 0 /* prefetch queue */
+
+  while (1)
+  {
+    if (fifo_pop() == -1)
+    {
+      if (is_prefetch_done) break ;
+    }
+    else
+    {
+      /* process the buffer */
+    }
+  }
+
+#elif 0 /* time only the memcpy */
+
+  static const size_t buffer_size = 4 * 0x1000;
+  for (i = 0; i < size; i += buffer_size)
+  {
+    uint64_t local_buffer[buffer_size] __attribute__((aligned(16)));
+
+    size_t j, k;
+    for (k = 0, j = i; k < buffer_size; ++k, ++j)
+      local_buffer[k] = ((uint64_t*)p)[j];
+  }
+
+#elif 1 /* sw prefetching code */
+
+  for (i = 0; i < size; ++i, ++p)
+  {
+    /* static const size_t pref_size = 128; */
+    /* _mm_prefetch((void*)((uintptr_t)p + pref_size), _MM_HINT_NTA); */
+    /* _mm_prefetch((void*)((uintptr_t)p + pref_size), _MM_HINT_T0); */
+    sum += fu(*p);
+  }
+
+#else /* default code */
+
+  for (i = 0; i < size; ++i, ++p)
+    sum += fu(*p);
+
 #endif
 
   gettimeofday(&now, NULL);
@@ -105,7 +296,7 @@ int main(int ac, char** av)
      av[3+i] the task physical cpus
    */
 
-#define CONFIG_MEM_SIZE (100 * 1024 * 1024)
+#define CONFIG_MEM_SIZE (10 * 1024 * 1024)
 #define CONFIG_ITER_COUNT 20
 
   const kaapi_procid_t source_id = atoi(av[1]);
@@ -221,15 +412,19 @@ int main(int ac, char** av)
 
   /* kaapi_proc_foreach(print_proc_counters, NULL); */
 
+#if 0
   kaapi_perf_counter_t self_counters[KAAPI_PERF_MAX_COUNTERS] = { 0, 0, 0 };
   kaapi_perf_accum_proc_counters(kaapi_proc_get_self(), self_counters);
-  printf("# MasterUsecs      : %lu\n", master_usecs);
+  printf("# MasterUsecs       : %lu\n", master_usecs);
 
   kaapi_perf_counter_t all_counters[KAAPI_PERF_MAX_COUNTERS] = { 0, 0, 0 };
   kaapi_perf_accum_all_counters(all_counters);
 
-  printf("# totalReadRequests: %llu\n", all_counters[1] - self_counters[1]);
-  printf("# totalCylesStalled: %llu\n", all_counters[2] - self_counters[2]);
+  printf("# totalReadRequests : %llu\n", all_counters[1] - self_counters[1]);
+  printf("# totalCyclesStalled: %llu\n", all_counters[2] - self_counters[2]);
+#else
+  printf("%lu", master_usecs);
+#endif
 
   kaapi_mt_join_threads(&cpu_map);
 
